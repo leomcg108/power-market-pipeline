@@ -12,11 +12,17 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 *.egg-info/
+dist/
+build/
+
+# Notebooks
+.ipynb_checkpoints/
 
 # dbt
 dbt/target/
 dbt/dbt_packages/
 dbt/logs/
+logs/
 
 # Databricks bundles
 .databricks/
