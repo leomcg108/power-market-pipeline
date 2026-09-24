@@ -5,11 +5,16 @@ description = "Daily pipeline for ENTSO-E electricity market data for Switzerlan
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "databricks-sdk>=0.117.0",
+    "httpx>=0.28.1",
+    "python-dotenv>=1.2.3",
     "typer>=0.27.2",
 ]
 
 [project.scripts]
 power-pipeline = "power_pipeline.cli:app"
+# Used by Databricks wheel tasks. Same commands, but no SystemExit on success.
+power-pipeline-job = "power_pipeline.cli:run_job"
 
 [dependency-groups]
 # dbt-databricks pins a narrow dbt-core range. Let it choose the dbt-core version.
@@ -20,6 +25,7 @@ dbt = [
 dev = [
     "pre-commit>=4.6.2",
     "pytest>=9.1.1",
+    "respx>=0.23.1",
     "ruff>=0.16.8",
 ]
 

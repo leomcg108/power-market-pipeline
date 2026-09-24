@@ -1,0 +1,68 @@
+# Databricks Asset Bundle: jobs deployed with `databricks bundle deploy`.
+# The workspace host and token come from DATABRICKS_HOST and DATABRICKS_TOKEN in the
+# environment, or from a Databricks CLI profile. Never write them here.
+bundle:
+  name: power-pipeline
+
+artifacts:
+  power_pipeline:
+    type: whl
+    build: uv build --wheel
+    # Stamp each build with a new version so serverless never reuses a cached wheel.
+    dynamic_version: true
+
+variables:
+  warehouse_id:
+    description: SQL warehouse that runs dbt tasks, looked up by name.
+    lookup:
+      warehouse: Serverless Starter Warehouse
+  secret_scope:
+    description: Secret scope that holds the ENTSO-E API token under the key entsoe-api-token.
+    default: power-pipeline
+
+sync:
+  exclude:
+    - .env
+
+resources:
+  jobs:
+    # Phase 00 spike: checks egress, secrets, a wheel task and a dbt task on serverless.
+    spike:
+      name: power-pipeline-spike
+      timeout_seconds: 1200
+      tasks:
+        - task_key: diagnose
+          environment_key: pipeline
+          python_wheel_task:
+            package_name: power_pipeline
+            entry_point: power-pipeline-job
+            parameters: ["diagnose", "--secret-scope", "${var.secret_scope}"]
+
+        # Independent of the Python task, so it still runs if that one fails.
+        - task_key: dbt_check
+          environment_key: dbt
+          dbt_task:
+            project_directory: ./dbt
+            warehouse_id: ${var.warehouse_id}
+            catalog: workspace
+            commands:
+              - dbt deps
+              - dbt debug
+              - 'dbt ls --resource-type model --output json --output-keys "database schema name"'
+
+      environments:
+        - environment_key: pipeline
+          spec:
+            environment_version: "5"
+            dependencies:
+              - ./dist/*.whl
+        - environment_key: dbt
+          spec:
+            environment_version: "5"
+            dependencies:
+              - dbt-databricks>=1.12,<2.0
+
+targets:
+  dev:
+    mode: development
+    default: true
