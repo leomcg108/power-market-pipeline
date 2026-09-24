@@ -78,6 +78,14 @@ Check that the API, the token and the secret scope are all reachable. The comman
 uv run power-pipeline diagnose --secret-scope power-pipeline
 ```
 
+Create the raw schema, the landing volume and the bronze tables. The command is safe to run again, since it only creates what is missing:
+
+```
+uv run power-pipeline setup
+```
+
+Bronze tables are append-only. Delta rejects any `UPDATE` or `DELETE` on them.
+
 Jobs are defined in `databricks.yml` and deployed as a bundle:
 
 ```

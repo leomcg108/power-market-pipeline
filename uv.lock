@@ -1265,6 +1265,8 @@ source = { editable = "." }
 dependencies = [
     { name = "databricks-sdk" },
     { name = "httpx" },
+    { name = "pandas" },
+    { name = "pyarrow" },
     { name = "python-dotenv" },
     { name = "typer" },
 ]
@@ -1285,6 +1287,8 @@ dev = [
 requires-dist = [
     { name = "databricks-sdk", specifier = ">=0.117.0" },
     { name = "httpx", specifier = ">=0.28.1" },
+    { name = "pandas", specifier = ">=3.0.6" },
+    { name = "pyarrow", specifier = ">=25.0.1" },
     { name = "python-dotenv", specifier = ">=1.2.3" },
     { name = "typer", specifier = ">=0.27.2" },
 ]
