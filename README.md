@@ -57,6 +57,35 @@ uv run --env-file ../.env dbt build --target dev
 
 The `dev` target writes to schemas with a `_dev` suffix, such as `power_staging_dev`, and builds only the last 14 days. To build from a given date, add `--vars '{start_date: 2024-01-01}'`.
 
+### Databricks jobs
+
+The Databricks CLI reads `DATABRICKS_HOST` and `DATABRICKS_TOKEN` from the environment. It does not read `.env`. The simplest setup is a CLI profile, made once:
+
+```
+databricks configure
+```
+
+Jobs read the ENTSO-E token from a secret scope called `power-pipeline`. Create it once. The second command asks for the token, so it never lands in your shell history:
+
+```
+databricks secrets create-scope power-pipeline
+databricks secrets put-secret power-pipeline entsoe-api-token
+```
+
+Check that the API, the token and the secret scope are all reachable. The command never prints the token:
+
+```
+uv run power-pipeline diagnose --secret-scope power-pipeline
+```
+
+Jobs are defined in `databricks.yml` and deployed as a bundle:
+
+```
+databricks bundle validate
+databricks bundle deploy -t dev
+databricks bundle run spike -t dev
+```
+
 ## Data source
 
 Electricity market data comes from the [ENTSO-E Transparency Platform](https://transparency.entsoe.eu).
