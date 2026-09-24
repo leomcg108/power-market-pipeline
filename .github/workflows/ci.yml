@@ -34,3 +34,30 @@ jobs:
 
       - name: Run tests
         run: uv run pytest
+
+  dbt:
+    name: dbt parse
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dbt
+    # dbt parse needs a valid profile but never connects, so placeholders are enough.
+    env:
+      DATABRICKS_HOST: https://placeholder.cloud.databricks.com
+      DATABRICKS_HTTP_PATH: /sql/1.0/warehouses/placeholder
+      DATABRICKS_TOKEN: placeholder
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Install dbt packages
+        run: uv run dbt deps
+
+      - name: Parse dbt project
+        run: uv run dbt parse --target dev
