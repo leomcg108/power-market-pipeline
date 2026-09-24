@@ -1,0 +1,33 @@
+[project]
+name = "power-pipeline"
+version = "0.1.0"
+description = "Daily pipeline for ENTSO-E electricity market data for Switzerland and Germany-Luxembourg"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "typer>=0.27.2",
+]
+
+[project.scripts]
+power-pipeline = "power_pipeline.cli:app"
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.6.2",
+    "pytest>=9.1.1",
+    "ruff>=0.16.8",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.18,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers"]
