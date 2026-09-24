@@ -115,6 +115,20 @@ def test_run_job_raises_system_exit_when_the_command_fails(monkeypatch):
     assert exc_info.value.code == 1
 
 
+def test_setup_runs_every_statement_on_the_warehouse_from_the_http_path(monkeypatch):
+    calls = []
+    monkeypatch.setenv("DATABRICKS_HTTP_PATH", "/sql/1.0/warehouses/abc123")
+    monkeypatch.setattr(
+        cli.databricks_io, "run_sql", lambda sql, warehouse_id: calls.append((sql, warehouse_id))
+    )
+
+    result = runner.invoke(app, ["setup"])
+
+    assert result.exit_code == 0, result.output
+    assert calls == [(sql, "abc123") for sql in cli.ingest.setup_statements()]
+    assert "ok: CREATE TABLE IF NOT EXISTS workspace.power_raw.bronze_prices (" in result.output
+
+
 @respx.mock
 def test_diagnose_fails_when_the_api_is_unreachable(monkeypatch):
     respx.get(client.BASE_URL).mock(side_effect=httpx.ConnectError("connection refused"))

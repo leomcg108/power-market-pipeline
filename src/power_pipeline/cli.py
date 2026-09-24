@@ -8,7 +8,7 @@ from typing import Annotated
 import typer
 from dotenv import find_dotenv, load_dotenv
 
-from power_pipeline import databricks_io
+from power_pipeline import databricks_io, ingest
 from power_pipeline.entsoe import client
 
 app = typer.Typer(
@@ -69,6 +69,23 @@ def diagnose(
         failed = True
 
     raise typer.Exit(code=1 if failed else 0)
+
+
+@app.command()
+def setup(
+    warehouse_id: Annotated[
+        str | None,
+        typer.Option(help="SQL warehouse ID. Defaults to the one in DATABRICKS_HTTP_PATH."),
+    ] = None,
+) -> None:
+    """Create the raw schema, landing volume and bronze tables if they do not exist.
+
+    Safe to run any number of times. Existing objects are left as they are.
+    """
+    warehouse_id = warehouse_id or databricks_io.warehouse_id_from_env()
+    for statement in ingest.setup_statements():
+        databricks_io.run_sql(statement, warehouse_id)
+        typer.echo(f"ok: {statement.splitlines()[0]}")
 
 
 def run_job() -> None:
