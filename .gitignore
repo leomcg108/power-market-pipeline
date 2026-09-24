@@ -1,0 +1,31 @@
+# Secrets
+.env
+
+# Private project rules, specs, planning and Claude Code commands
+docs/
+CLAUDE.md
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# dbt
+dbt/target/
+dbt/dbt_packages/
+dbt/logs/
+
+# Databricks bundles
+.databricks/
+
+# Local data
+data/
+
+# Editor and local notes
+*.code-workspace
+.vscode/
+START-HERE.md
+.claude/
