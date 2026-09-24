@@ -1,0 +1,12 @@
+zones:
+  CH:
+    name: Switzerland
+    eic: 10YCH-SWISSGRIDZ
+  DE_LU:
+    name: Germany-Luxembourg
+    eic: 10Y1001A1001A82H
+borders:
+  - from: CH
+    to: DE_LU
+  - from: DE_LU
+    to: CH

@@ -1,4 +1,5 @@
-from datetime import UTC, datetime
+import gzip
+from datetime import UTC, date, datetime, timedelta
 from fnmatch import fnmatchcase
 from zoneinfo import ZoneInfo
 
@@ -188,3 +189,50 @@ def test_load_bronze_returns_the_number_of_inserted_rows(monkeypatch):
 
     assert ingest.load_bronze("prices", "wh-1") == 96
     assert calls == [(ingest.copy_into_bronze_sql("prices"), "wh-1")]
+
+
+@pytest.mark.parametrize(
+    ("delivery_date", "start", "hours"),
+    [
+        (date(2026, 9, 23), datetime(2026, 9, 22, 22, 0, tzinfo=UTC), 24),  # summer time
+        (date(2026, 1, 15), datetime(2026, 1, 14, 23, 0, tzinfo=UTC), 24),  # winter time
+        (date(2024, 3, 31), datetime(2024, 3, 30, 23, 0, tzinfo=UTC), 23),  # clocks go forward
+        (date(2024, 10, 27), datetime(2024, 10, 26, 22, 0, tzinfo=UTC), 25),  # clocks go back
+        (date(2025, 3, 30), datetime(2025, 3, 29, 23, 0, tzinfo=UTC), 23),
+        (date(2025, 10, 26), datetime(2025, 10, 25, 22, 0, tzinfo=UTC), 25),
+        (date(2026, 3, 29), datetime(2026, 3, 28, 23, 0, tzinfo=UTC), 23),
+        (date(2026, 10, 25), datetime(2026, 10, 24, 22, 0, tzinfo=UTC), 25),
+    ],
+)
+def test_delivery_day_window_utc(delivery_date, start, hours):
+    window_start, window_end = ingest.delivery_day_window_utc(delivery_date)
+
+    assert window_start == start
+    assert window_end - window_start == timedelta(hours=hours)
+    assert window_start.tzinfo == UTC
+
+
+def test_local_raw_path(tmp_path):
+    assert ingest.local_raw_path(tmp_path, relative_path()) == (
+        tmp_path
+        / "raw/entsoe/prices/DE_LU/2026/09/20260922T2200Z_20260923T2200Z_20260924T143012Z.xml.gz"
+    )
+
+
+def test_write_raw_file_gzips_the_exact_bytes(tmp_path):
+    content = b'<?xml version="1.0"?>\r\n<Doc>\xc3\xa9 CRLF and UTF-8 bytes kept as-is</Doc>\n'
+    path = tmp_path / "nested" / "response.xml.gz"
+
+    ingest.write_raw_file(content, path)
+
+    assert gzip.decompress(path.read_bytes()) == content
+
+
+def test_write_raw_file_never_overwrites(tmp_path):
+    path = tmp_path / "response.xml.gz"
+    ingest.write_raw_file(b"first", path)
+
+    with pytest.raises(FileExistsError):
+        ingest.write_raw_file(b"second", path)
+
+    assert gzip.decompress(path.read_bytes()) == b"first"

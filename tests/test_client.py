@@ -1,8 +1,34 @@
+import logging
+from pathlib import Path
+
 import httpx
 import pytest
 import respx
 
 from power_pipeline.entsoe import client
+
+FIXTURES = Path(__file__).parent / "fixtures"
+AUTH_FAILED = (FIXTURES / "ack_authentication_failed.xml").read_bytes()
+# Stand-in until a real "no data" response is saved, which needs a token: the real
+# acknowledgement above with only its reason text replaced.
+NO_DATA = AUTH_FAILED.replace(
+    b"<text>Authentication failed.</text>",
+    b"<text>No matching data found for Data item Day-ahead Prices [12.1.D].</text>",
+)
+# Stand-in data document until real price responses are saved. Only its root matters here.
+PUBLICATION = (
+    b'<?xml version="1.0" encoding="UTF-8"?>\n'
+    b'<Publication_MarketDocument xmlns="urn:iec62325.351:tc57wg16:451-3:publicationdocument:7:3"/>'
+)
+
+TOKEN = "11111111-2222-3333-4444-555555555555"
+PARAMS = {
+    "documentType": "A44",
+    "in_Domain": "10Y1001A1001A82H",
+    "out_Domain": "10Y1001A1001A82H",
+    "periodStart": "202609222200",
+    "periodEnd": "202609232200",
+}
 
 
 def fail_if_called(*args, **kwargs):
@@ -78,3 +104,155 @@ def test_check_reachable_reports_a_timeout_as_unreachable():
 
     assert not result.ok
     assert "ConnectTimeout" in result.detail
+
+
+def test_no_data_stand_in_differs_from_the_real_fixture_only_in_reason_text():
+    assert NO_DATA != AUTH_FAILED
+    assert NO_DATA.count(b"No matching data found") == 1
+
+
+def test_parse_acknowledgement_reads_the_real_authentication_failure():
+    acknowledgement = client.parse_acknowledgement(AUTH_FAILED)
+
+    assert acknowledgement.reasons == (("999", "Authentication failed."),)
+    assert not acknowledgement.is_no_data
+
+
+def test_is_no_data_needs_the_no_data_text_not_just_code_999():
+    assert client.parse_acknowledgement(NO_DATA).is_no_data
+    assert not client.parse_acknowledgement(AUTH_FAILED).is_no_data
+
+
+@pytest.mark.parametrize(
+    "reasons",
+    [
+        (),
+        (("999", "No matching data found for X."), ("999", "Authentication failed.")),
+        (("998", "No matching data found for X."),),
+    ],
+)
+def test_is_no_data_is_false_unless_every_reason_is_no_data(reasons):
+    assert not client.Acknowledgement(reasons=reasons).is_no_data
+
+
+def test_parse_acknowledgement_reads_the_namespace_from_the_root_element():
+    other_version = AUTH_FAILED.replace(
+        b"acknowledgementdocument:7:0", b"acknowledgementdocument:8:1"
+    )
+
+    acknowledgement = client.parse_acknowledgement(other_version)
+
+    assert acknowledgement.reasons == (("999", "Authentication failed."),)
+
+
+@pytest.mark.parametrize("content", [PUBLICATION, b"not xml", b""])
+def test_parse_acknowledgement_returns_none_for_anything_else(content):
+    assert client.parse_acknowledgement(content) is None
+
+
+@respx.mock
+def test_fetch_sends_the_params_and_the_token_as_query_parameters():
+    route = respx.get(client.BASE_URL).mock(return_value=httpx.Response(200, content=PUBLICATION))
+
+    client.fetch(PARAMS, TOKEN)
+
+    assert dict(route.calls.last.request.url.params) == {**PARAMS, "securityToken": TOKEN}
+
+
+@respx.mock
+def test_fetch_returns_the_body_exactly_as_received():
+    respx.get(client.BASE_URL).mock(return_value=httpx.Response(200, content=PUBLICATION))
+
+    result = client.fetch(PARAMS, TOKEN)
+
+    assert result.status == "data"
+    assert result.http_status == 200
+    assert result.root_element == "Publication_MarketDocument"
+    assert result.content == PUBLICATION
+    assert result.request_params == PARAMS
+
+
+@respx.mock
+@pytest.mark.parametrize("http_status", [200, 400])
+def test_fetch_treats_a_no_data_acknowledgement_as_no_data(http_status):
+    respx.get(client.BASE_URL).mock(return_value=httpx.Response(http_status, content=NO_DATA))
+
+    result = client.fetch(PARAMS, TOKEN)
+
+    assert result.status == "no_data"
+    assert result.http_status == http_status
+    assert result.content == NO_DATA
+
+
+@respx.mock
+def test_fetch_raises_on_any_other_acknowledgement():
+    respx.get(client.BASE_URL).mock(return_value=httpx.Response(401, content=AUTH_FAILED))
+
+    with pytest.raises(
+        client.EntsoeApiError, match="HTTP 401, acknowledgement 999: Authentication"
+    ):
+        client.fetch(PARAMS, TOKEN)
+
+
+@respx.mock
+def test_fetch_raises_on_http_errors_without_leaking_the_token():
+    body = f"Bad gateway for /api?documentType=A44&securityToken={TOKEN}"
+    respx.get(client.BASE_URL).mock(return_value=httpx.Response(502, text=body))
+
+    with pytest.raises(client.EntsoeApiError, match="HTTP 502") as exc_info:
+        client.fetch(PARAMS, TOKEN)
+
+    assert TOKEN not in str(exc_info.value)
+    assert "securityToken=***" in str(exc_info.value)
+
+
+@respx.mock
+def test_fetch_raises_when_a_200_response_is_not_xml():
+    respx.get(client.BASE_URL).mock(return_value=httpx.Response(200, text="<html>oops"))
+
+    with pytest.raises(client.EntsoeApiError, match="not XML"):
+        client.fetch(PARAMS, TOKEN)
+
+
+@respx.mock
+def test_fetch_raises_on_network_errors_without_leaking_the_token():
+    url = f"{client.BASE_URL}?securityToken={TOKEN}"
+    respx.get(client.BASE_URL).mock(side_effect=httpx.ConnectError(f"cannot reach {url}"))
+
+    with pytest.raises(client.EntsoeApiError, match="ConnectError") as exc_info:
+        client.fetch(PARAMS, TOKEN)
+
+    assert TOKEN not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+
+
+def test_fetch_refuses_a_token_inside_params():
+    with pytest.raises(ValueError, match="Pass the token separately"):
+        client.fetch({**PARAMS, "securityToken": TOKEN}, TOKEN)
+
+
+@respx.mock
+def test_fetch_never_logs_the_token(caplog):
+    respx.get(client.BASE_URL).mock(return_value=httpx.Response(200, content=PUBLICATION))
+    caplog.set_level(logging.DEBUG)
+
+    client.fetch(PARAMS, TOKEN)
+
+    assert TOKEN not in caplog.text
+
+
+@respx.mock
+def test_httpx_would_log_the_token_if_its_logger_were_left_at_info(caplog):
+    # Shows why the client raises the httpx logger to WARNING.
+    respx.get(client.BASE_URL).mock(return_value=httpx.Response(200, content=PUBLICATION))
+    caplog.set_level(logging.INFO, logger="httpx")
+
+    client.fetch(PARAMS, TOKEN)
+
+    assert TOKEN in caplog.text
+
+
+def test_redact_removes_the_token_and_any_token_query_parameter():
+    text = f"token {TOKEN} and url ?a=1&securityToken=other-token&b=2"
+
+    assert client.redact(text, TOKEN) == "token *** and url ?a=1&securityToken=***&b=2"

@@ -44,6 +44,16 @@ uv run ruff format --check .
 uv run power-pipeline --help
 ```
 
+### Fetch data from ENTSO-E
+
+Fetch one delivery day and save the raw XML, gzipped, under `data/raw/`. The date is the local delivery day in Europe/Zurich time:
+
+```
+uv run power-pipeline fetch --dataset prices --zone DE_LU --date 2026-09-23
+```
+
+Zones and datasets are defined in `config/zones.yaml` and `config/datasets.yaml`.
+
 ### dbt
 
 The dbt project lives in `dbt/`. dbt does not read `.env` itself, so pass it through uv:

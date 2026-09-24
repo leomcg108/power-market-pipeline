@@ -1,0 +1,18 @@
+# ENTSO-E API request definitions, one per dataset.
+#
+# `params` are sent as query parameters. `{eic}` is replaced by the zone's EIC code
+# from zones.yaml. periodStart and periodEnd are added per request. The token is added
+# by the client and never stored here.
+#
+# Source: ENTSO-E Transparency Platform RESTful API guide (Postman collection).
+# Load, generation and flows are added after the Phase 00 spike confirms their
+# parameter names.
+datasets:
+  prices:
+    description: Day-ahead prices [12.1.D]
+    params:
+      documentType: A44
+      in_Domain: "{eic}"
+      out_Domain: "{eic}"
+      # A01 = day-ahead. Without it the response can also hold intraday auction prices.
+      contract_MarketAgreement.type: A01
