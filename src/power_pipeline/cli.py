@@ -2,14 +2,16 @@
 
 import os
 import platform
+from datetime import UTC, datetime
 from importlib.metadata import version
+from pathlib import Path
 from typing import Annotated
 
 import typer
 from dotenv import find_dotenv, load_dotenv
 
 from power_pipeline import databricks_io, ingest
-from power_pipeline.entsoe import client
+from power_pipeline.entsoe import client, datasets
 
 app = typer.Typer(
     help="Collect ENTSO-E electricity market data for CH and DE-LU.",
@@ -69,6 +71,48 @@ def diagnose(
         failed = True
 
     raise typer.Exit(code=1 if failed else 0)
+
+
+@app.command()
+def fetch(
+    dataset: Annotated[str, typer.Option(help="Dataset from config/datasets.yaml.")],
+    zone: Annotated[str, typer.Option(help="Zone from config/zones.yaml, for example DE_LU.")],
+    delivery_date: Annotated[
+        datetime,
+        typer.Option("--date", formats=["%Y-%m-%d"], help="Delivery day, local time."),
+    ],
+    secret_scope: Annotated[
+        str | None,
+        typer.Option(help="Secret scope with the ENTSO-E token, if ENTSOE_API_TOKEN is unset."),
+    ] = None,
+    data_dir: Annotated[Path, typer.Option(help="Local data folder.")] = Path("data"),
+) -> None:
+    """Fetch one delivery day from ENTSO-E and save the raw XML, gzipped, under data/raw/."""
+    known_datasets = datasets.load_datasets()
+    known_zones = datasets.load_zones()
+    if dataset not in known_datasets:
+        raise typer.BadParameter(f"choose from {sorted(known_datasets)}", param_hint="--dataset")
+    if zone not in known_zones:
+        raise typer.BadParameter(f"choose from {sorted(known_zones)}", param_hint="--zone")
+
+    start, end = ingest.delivery_day_window_utc(delivery_date.date())
+    params = datasets.build_params(known_datasets[dataset], known_zones[zone], start, end)
+    try:
+        token = client.get_token(secret_scope)
+        result = client.fetch(params, token)
+    except (client.MissingTokenError, client.EntsoeApiError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from None
+
+    relative_path = ingest.landing_relative_path(dataset, zone, start, end, datetime.now(UTC))
+    path = ingest.local_raw_path(data_dir, relative_path)
+    ingest.write_raw_file(result.content, path)
+    typer.echo(f"window: {start:%Y-%m-%d %H:%M} to {end:%Y-%m-%d %H:%M} UTC")
+    typer.echo(
+        f"status: {result.status} (HTTP {result.http_status}, "
+        f"{result.root_element}, {len(result.content)} bytes)"
+    )
+    typer.echo(f"saved: {path}")
 
 
 @app.command()
