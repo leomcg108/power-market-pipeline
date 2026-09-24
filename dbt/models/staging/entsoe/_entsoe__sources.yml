@@ -1,0 +1,44 @@
+version: 2
+
+sources:
+  - name: entsoe
+    description: >
+      Bronze tables loaded from ENTSO-E Transparency Platform files with COPY INTO.
+      Append-only: every fetch adds rows, so the same value can appear more than once.
+      All timestamps are UTC.
+    database: workspace
+    schema: power_raw
+    tables:
+      - name: bronze_prices
+        description: Day-ahead prices as parsed from ENTSO-E A44 documents, one row per interval per fetch.
+        columns:
+          - name: dataset
+            description: Dataset name. Always `prices` in this table.
+          - name: zone
+            description: Bidding zone code from config/zones.yaml, for example `DE_LU` or `CH`.
+          - name: psr_type
+            description: ENTSO-E production type code. Always null for prices.
+          - name: resolution
+            description: Native length of one interval, `PT15M` or `PT60M`.
+          - name: interval_start_utc
+            description: Start of the delivery interval, UTC.
+          - name: interval_end_utc
+            description: End of the delivery interval, UTC.
+          - name: value
+            description: Price as sent by ENTSO-E.
+          - name: unit
+            description: Unit of `value`.
+          - name: document_mrid
+            description: ENTSO-E document identifier.
+          - name: time_series_mrid
+            description: Identifier of the time series inside the document.
+          - name: revision_number
+            description: ENTSO-E revision number of the document.
+          - name: created_datetime_utc
+            description: When ENTSO-E created the document, UTC.
+          - name: ingested_at_utc
+            description: When our pipeline fetched the document, UTC.
+          - name: source_file
+            description: Volume path of the raw XML file this row was parsed from.
+          - name: request_params
+            description: JSON of the API request parameters, without the token.

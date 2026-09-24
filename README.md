@@ -44,6 +44,19 @@ uv run ruff format --check .
 uv run power-pipeline --help
 ```
 
+### dbt
+
+The dbt project lives in `dbt/`. dbt does not read `.env` itself, so pass it through uv:
+
+```
+cd dbt
+uv run dbt deps
+uv run --env-file ../.env dbt debug
+uv run --env-file ../.env dbt build --target dev
+```
+
+The `dev` target writes to schemas with a `_dev` suffix, such as `power_staging_dev`, and builds only the last 14 days. To build from a given date, add `--vars '{start_date: 2024-01-01}'`.
+
 ## Data source
 
 Electricity market data comes from the [ENTSO-E Transparency Platform](https://transparency.entsoe.eu).

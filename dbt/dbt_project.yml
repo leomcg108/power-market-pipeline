@@ -1,0 +1,23 @@
+name: power_pipeline
+version: "1.0.0"
+profile: power_pipeline
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+
+clean-targets:
+  - target
+  - dbt_packages
+
+vars:
+  # Earliest interval_start_utc to build, as YYYY-MM-DD. Leave empty to use the
+  # target default: the last 14 days in dev and ci, all history in prod.
+  start_date:
+
+models:
+  power_pipeline:
+    staging:
+      +schema: power_staging
+      +materialized: view

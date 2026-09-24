@@ -1,0 +1,47 @@
+version: 2
+
+models:
+  - name: stg_entsoe__prices
+    description: >
+      Day-ahead prices from ENTSO-E at their native resolution, typed and renamed.
+      One row per bronze row. Repeated fetches of the same value are not removed yet.
+      All timestamps are UTC.
+    columns:
+      - name: zone
+        description: Bidding zone code, for example `DE_LU` or `CH`.
+        data_tests:
+          - not_null
+      - name: resolution
+        description: >
+          Native length of one interval. `PT60M` is hourly and `PT15M` is quarter-hourly.
+          DE-LU prices are hourly before 1 October 2025 and quarter-hourly from then on.
+        data_tests:
+          - not_null
+      - name: interval_start_utc
+        description: Start of the delivery interval, UTC.
+        data_tests:
+          - not_null
+      - name: interval_end_utc
+        description: End of the delivery interval, UTC.
+        data_tests:
+          - not_null
+      - name: price_eur_mwh
+        description: Day-ahead price in EUR per MWh. Can be negative.
+        data_tests:
+          - not_null
+      - name: unit
+        description: Unit of the price as recorded at ingestion.
+      - name: document_mrid
+        description: ENTSO-E document identifier.
+      - name: time_series_mrid
+        description: Identifier of the time series inside the document.
+      - name: revision_number
+        description: ENTSO-E revision number of the document. Higher means newer.
+      - name: created_datetime_utc
+        description: When ENTSO-E created the document, UTC.
+      - name: ingested_at_utc
+        description: When our pipeline fetched the document, UTC.
+        data_tests:
+          - not_null
+      - name: source_file
+        description: Volume path of the raw XML file this row was parsed from.

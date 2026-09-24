@@ -12,11 +12,19 @@ dependencies = [
 power-pipeline = "power_pipeline.cli:app"
 
 [dependency-groups]
+# dbt-databricks pins a narrow dbt-core range. Let it choose the dbt-core version.
+dbt = [
+    "dbt-core>=1.11",
+    "dbt-databricks>=1.12",
+]
 dev = [
     "pre-commit>=4.6.2",
     "pytest>=9.1.1",
     "ruff>=0.16.8",
 ]
+
+[tool.uv]
+default-groups = ["dev", "dbt"]
 
 [build-system]
 requires = ["uv_build>=0.12.18,<0.13.0"]
