@@ -1,8 +1,10 @@
-"""Store and load ENTSO-E data: landing paths, Parquet files and bronze tables."""
+"""Store and load ENTSO-E data: windows, landing paths, raw and Parquet files, bronze tables."""
 
+import gzip
 import re
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pyarrow as pa
@@ -46,6 +48,19 @@ PARSED_FILE_PATTERN = "*/*/*/*.parquet"
 
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9_]+$")
 
+MARKET_TIME_ZONE = ZoneInfo("Europe/Zurich")
+
+
+def delivery_day_window_utc(delivery_date: date) -> tuple[datetime, datetime]:
+    """UTC start and end of one delivery day, which runs midnight to midnight local time.
+
+    Local time is Europe/Zurich, the same as CET/CEST in Germany. The window is 24 hours
+    long, except 23 hours on the spring clock change and 25 on the autumn one.
+    """
+    start = datetime.combine(delivery_date, time(0), tzinfo=MARKET_TIME_ZONE)
+    end = datetime.combine(delivery_date + timedelta(days=1), time(0), tzinfo=MARKET_TIME_ZONE)
+    return start.astimezone(UTC), end.astimezone(UTC)
+
 
 def _as_utc(moment: datetime, name: str) -> datetime:
     if moment.tzinfo is None:
@@ -84,6 +99,18 @@ def raw_volume_path(relative_path: str) -> str:
 def parsed_volume_path(relative_path: str) -> str:
     """Volume path of the parsed Parquet file for a landing path."""
     return f"{PARSED_VOLUME_DIR}/{relative_path}.parquet"
+
+
+def local_raw_path(data_dir: Path, relative_path: str) -> Path:
+    """Local path of the gzipped raw XML: <data_dir>/raw/<landing path>.xml.gz."""
+    return data_dir / "raw" / f"{relative_path}.xml.gz"
+
+
+def write_raw_file(content: bytes, path: Path) -> None:
+    """Save a response body gzipped, byte for byte. Never overwrites an existing file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("xb") as handle, gzip.GzipFile(fileobj=handle, mode="wb", mtime=0) as gz:
+        gz.write(content)
 
 
 def write_parquet(frame: pd.DataFrame, path: Path, schema: pa.Schema) -> None:
