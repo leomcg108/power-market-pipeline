@@ -9,23 +9,15 @@ from power_pipeline.entsoe import client
 
 FIXTURES = Path(__file__).parent / "fixtures"
 AUTH_FAILED = (FIXTURES / "ack_authentication_failed.xml").read_bytes()
-# Stand-in until a real "no data" response is saved, which needs a token: the real
-# acknowledgement above with only its reason text replaced.
-NO_DATA = AUTH_FAILED.replace(
-    b"<text>Authentication failed.</text>",
-    b"<text>No matching data found for Data item Day-ahead Prices [12.1.D].</text>",
-)
-# Stand-in data document until real price responses are saved. Only its root matters here.
-PUBLICATION = (
-    b'<?xml version="1.0" encoding="UTF-8"?>\n'
-    b'<Publication_MarketDocument xmlns="urn:iec62325.351:tc57wg16:451-3:publicationdocument:7:3"/>'
-)
+NO_DATA = (FIXTURES / "ack_no_data.xml").read_bytes()
+PRICES = (FIXTURES / "prices_de_lu_2026-09-23.xml").read_bytes()
 
 TOKEN = "11111111-2222-3333-4444-555555555555"
 PARAMS = {
     "documentType": "A44",
     "in_Domain": "10Y1001A1001A82H",
     "out_Domain": "10Y1001A1001A82H",
+    "contract_MarketAgreement.type": "A01",
     "periodStart": "202609222200",
     "periodEnd": "202609232200",
 }
@@ -106,9 +98,13 @@ def test_check_reachable_reports_a_timeout_as_unreachable():
     assert "ConnectTimeout" in result.detail
 
 
-def test_no_data_stand_in_differs_from_the_real_fixture_only_in_reason_text():
-    assert NO_DATA != AUTH_FAILED
-    assert NO_DATA.count(b"No matching data found") == 1
+def test_parse_acknowledgement_reads_the_real_no_data_response():
+    acknowledgement = client.parse_acknowledgement(NO_DATA)
+
+    [(code, text)] = acknowledgement.reasons
+    assert code == "999"
+    assert text.startswith("No matching data found for Data item ENERGY_PRICES [12.1.D]")
+    assert acknowledgement.is_no_data
 
 
 def test_parse_acknowledgement_reads_the_real_authentication_failure():
@@ -145,14 +141,14 @@ def test_parse_acknowledgement_reads_the_namespace_from_the_root_element():
     assert acknowledgement.reasons == (("999", "Authentication failed."),)
 
 
-@pytest.mark.parametrize("content", [PUBLICATION, b"not xml", b""])
+@pytest.mark.parametrize("content", [PRICES, b"not xml", b""])
 def test_parse_acknowledgement_returns_none_for_anything_else(content):
     assert client.parse_acknowledgement(content) is None
 
 
 @respx.mock
 def test_fetch_sends_the_params_and_the_token_as_query_parameters():
-    route = respx.get(client.BASE_URL).mock(return_value=httpx.Response(200, content=PUBLICATION))
+    route = respx.get(client.BASE_URL).mock(return_value=httpx.Response(200, content=PRICES))
 
     client.fetch(PARAMS, TOKEN)
 
@@ -161,14 +157,14 @@ def test_fetch_sends_the_params_and_the_token_as_query_parameters():
 
 @respx.mock
 def test_fetch_returns_the_body_exactly_as_received():
-    respx.get(client.BASE_URL).mock(return_value=httpx.Response(200, content=PUBLICATION))
+    respx.get(client.BASE_URL).mock(return_value=httpx.Response(200, content=PRICES))
 
     result = client.fetch(PARAMS, TOKEN)
 
     assert result.status == "data"
     assert result.http_status == 200
     assert result.root_element == "Publication_MarketDocument"
-    assert result.content == PUBLICATION
+    assert result.content == PRICES
     assert result.request_params == PARAMS
 
 
@@ -233,7 +229,7 @@ def test_fetch_refuses_a_token_inside_params():
 
 @respx.mock
 def test_fetch_never_logs_the_token(caplog):
-    respx.get(client.BASE_URL).mock(return_value=httpx.Response(200, content=PUBLICATION))
+    respx.get(client.BASE_URL).mock(return_value=httpx.Response(200, content=PRICES))
     caplog.set_level(logging.DEBUG)
 
     client.fetch(PARAMS, TOKEN)
@@ -244,7 +240,7 @@ def test_fetch_never_logs_the_token(caplog):
 @respx.mock
 def test_httpx_would_log_the_token_if_its_logger_were_left_at_info(caplog):
     # Shows why the client raises the httpx logger to WARNING.
-    respx.get(client.BASE_URL).mock(return_value=httpx.Response(200, content=PUBLICATION))
+    respx.get(client.BASE_URL).mock(return_value=httpx.Response(200, content=PRICES))
     caplog.set_level(logging.INFO, logger="httpx")
 
     client.fetch(PARAMS, TOKEN)

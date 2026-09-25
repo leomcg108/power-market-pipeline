@@ -15,14 +15,8 @@ runner = CliRunner()
 
 FIXTURES = Path(__file__).parent / "fixtures"
 AUTH_FAILED = (FIXTURES / "ack_authentication_failed.xml").read_bytes()
-# Stand-ins until real responses are saved. See tests/test_client.py.
-NO_DATA = AUTH_FAILED.replace(
-    b"<text>Authentication failed.</text>",
-    b"<text>No matching data found for Data item Day-ahead Prices [12.1.D].</text>",
-)
-PUBLICATION = (
-    b'<Publication_MarketDocument xmlns="urn:iec62325.351:tc57wg16:451-3:publicationdocument:7:3"/>'
-)
+NO_DATA = (FIXTURES / "ack_no_data.xml").read_bytes()
+PRICES = (FIXTURES / "prices_de_lu_2026-09-23.xml").read_bytes()
 TOKEN = "11111111-2222-3333-4444-555555555555"
 FETCH_DE_LU = ["fetch", "--dataset", "prices", "--zone", "DE_LU", "--date", "2026-09-23"]
 
@@ -33,7 +27,7 @@ def saved_files(data_dir):
 
 @respx.mock
 def test_fetch_saves_the_raw_response_for_the_delivery_day(monkeypatch, tmp_path):
-    route = respx.get(client.BASE_URL).mock(return_value=httpx.Response(200, content=PUBLICATION))
+    route = respx.get(client.BASE_URL).mock(return_value=httpx.Response(200, content=PRICES))
     monkeypatch.setenv("ENTSOE_API_TOKEN", TOKEN)
 
     result = runner.invoke(app, [*FETCH_DE_LU, "--data-dir", str(tmp_path)])
@@ -47,7 +41,7 @@ def test_fetch_saves_the_raw_response_for_the_delivery_day(monkeypatch, tmp_path
     folder = saved.parent.relative_to(tmp_path).as_posix()
     assert folder == "raw/entsoe/prices/DE_LU/2026/09"
     assert saved.name.startswith("20260922T2200Z_20260923T2200Z_")
-    assert gzip.decompress(saved.read_bytes()) == PUBLICATION
+    assert gzip.decompress(saved.read_bytes()) == PRICES
     assert "status: data (HTTP 200, Publication_MarketDocument" in result.output
     assert TOKEN not in result.output
 
