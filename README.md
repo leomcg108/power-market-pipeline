@@ -52,7 +52,18 @@ Fetch one delivery day and save the raw XML, gzipped, under `data/raw/`. The dat
 uv run power-pipeline fetch --dataset prices --zone DE_LU --date 2026-09-23
 ```
 
-Zones and datasets are defined in `config/zones.yaml` and `config/datasets.yaml`.
+Zones, borders and datasets are defined in `config/zones.yaml` and `config/datasets.yaml`. There are four datasets:
+
+| Dataset | ENTSO-E data item | Requested per |
+|---|---|---|
+| `prices` | Day-ahead prices [12.1.D] | zone |
+| `load` | Actual total load [6.1.A] | zone |
+| `generation` | Actual generation per production type [16.1.B&C] | zone |
+| `flows` | Cross-border physical flows [12.1.G] | border direction |
+
+`fetch` works for the zone datasets. Fetching flows per border direction comes with the backfill and daily commands.
+
+DE-LU day-ahead prices come as two series per day. Sequence 1 is the main European auction (SDAC). Sequence 2 is a separate auction run by the EXAA exchange. Both are stored, and the modelled tables use SDAC.
 
 ### dbt
 

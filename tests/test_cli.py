@@ -214,3 +214,12 @@ def test_diagnose_fails_when_the_api_is_unreachable(monkeypatch):
 
     assert result.exit_code == 1
     assert "entsoe api: NOT reachable (ConnectError" in result.output
+
+
+def test_fetch_explains_that_border_datasets_are_not_supported_yet(tmp_path):
+    args = ["fetch", "--dataset", "flows", "--zone", "CH", "--date", "2026-09-23"]
+
+    result = runner.invoke(app, [*args, "--data-dir", str(tmp_path)])
+
+    assert result.exit_code == 2
+    assert "requested per border direction" in result.output

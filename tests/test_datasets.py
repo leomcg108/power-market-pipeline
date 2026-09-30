@@ -72,3 +72,92 @@ def test_build_params_rejects_unknown_placeholders():
 
     with pytest.raises(ValueError, match="Unknown placeholder 'border' in flows param in_Domain"):
         datasets.build_params(dataset, zone, WINDOW_START, WINDOW_END)
+
+
+def zone_params(dataset_name, zone):
+    dataset = datasets.load_datasets()[dataset_name]
+    return datasets.build_params(dataset, datasets.load_zones()[zone], WINDOW_START, WINDOW_END)
+
+
+def test_load_datasets_defines_all_four_datasets_with_their_scope():
+    scopes = {name: d.scope for name, d in datasets.load_datasets().items()}
+
+    assert scopes == {"prices": "zone", "load": "zone", "generation": "zone", "flows": "border"}
+
+
+def test_load_borders_reads_both_directions():
+    assert datasets.load_borders() == [
+        datasets.Border(from_zone="CH", to_zone="DE_LU"),
+        datasets.Border(from_zone="DE_LU", to_zone="CH"),
+    ]
+
+
+def test_build_params_for_de_lu_actual_load():
+    assert zone_params("load", "DE_LU") == {
+        "documentType": "A65",
+        "processType": "A16",
+        "outBiddingZone_Domain": "10Y1001A1001A82H",
+        "periodStart": "202609222200",
+        "periodEnd": "202609232200",
+    }
+
+
+def test_build_params_for_ch_actual_generation():
+    assert zone_params("generation", "CH") == {
+        "documentType": "A75",
+        "processType": "A16",
+        "in_Domain": "10YCH-SWISSGRIDZ",
+        "periodStart": "202609222200",
+        "periodEnd": "202609232200",
+    }
+
+
+@pytest.mark.parametrize(
+    ("from_zone", "to_zone", "out_domain", "in_domain"),
+    [
+        ("CH", "DE_LU", "10YCH-SWISSGRIDZ", "10Y1001A1001A82H"),
+        ("DE_LU", "CH", "10Y1001A1001A82H", "10YCH-SWISSGRIDZ"),
+    ],
+)
+def test_build_border_params_for_flows_sets_out_as_from_and_in_as_to(
+    from_zone, to_zone, out_domain, in_domain
+):
+    zones = datasets.load_zones()
+    flows = datasets.load_datasets()["flows"]
+
+    params = datasets.build_border_params(
+        flows, zones[from_zone], zones[to_zone], WINDOW_START, WINDOW_END
+    )
+
+    assert params == {
+        "documentType": "A11",
+        "out_Domain": out_domain,
+        "in_Domain": in_domain,
+        "periodStart": "202609222200",
+        "periodEnd": "202609232200",
+    }
+
+
+def test_build_params_refuses_a_border_dataset():
+    flows = datasets.load_datasets()["flows"]
+
+    with pytest.raises(ValueError, match="flows is requested per border"):
+        datasets.build_params(flows, datasets.load_zones()["CH"], WINDOW_START, WINDOW_END)
+
+
+def test_build_border_params_refuses_a_zone_dataset():
+    zones = datasets.load_zones()
+    prices = datasets.load_datasets()["prices"]
+
+    with pytest.raises(ValueError, match="prices is requested per zone"):
+        datasets.build_border_params(prices, zones["CH"], zones["DE_LU"], WINDOW_START, WINDOW_END)
+
+
+def test_load_datasets_rejects_an_unknown_scope(tmp_path):
+    (tmp_path / "datasets.yaml").write_text(
+        "datasets:\n  x:\n    description: X\n    scope: country\n    params: {}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="unknown scope 'country'"):
+        datasets.load_datasets(tmp_path)
