@@ -265,3 +265,34 @@ def test_raises_on_a_position_beyond_the_end_of_the_period():
 
     with pytest.raises(ParseError):
         parse_timeseries(renumbered)
+
+
+def test_reads_quantity_when_a_point_has_no_price():
+    # Derived: CH with price.amount renamed to quantity, as in load and generation documents.
+    as_quantities = CH.replace(b"price.amount", b"quantity")
+
+    frame = parse_timeseries(as_quantities)
+
+    assert frame["value"].tolist() == parse_timeseries(CH)["value"].tolist()
+
+
+# Guard rails: each derived document breaks one rule and must raise ParseError.
+BROKEN_DOCUMENTS = {
+    "not xml": b"<Publication_MarketDocument",
+    "missing resolution": CH.replace(b"<resolution>PT60M</resolution>", b""),
+    "unsupported resolution": CH.replace(
+        b"<resolution>PT60M</resolution>", b"<resolution>P1D</resolution>"
+    ),
+    "timestamp not in UTC": CH.replace(b"2026-09-22T22:00Z", b"2026-09-23T00:00+02:00"),
+    "period not a whole number of hours": CH.replace(b"2026-09-23T22:00Z", b"2026-09-23T22:30Z"),
+    "position repeated": CH.replace(b"<position>2</position>", b"<position>1</position>"),
+    "point without a value": CH.replace(b"<price.amount>194.59</price.amount>", b""),
+}
+
+
+@pytest.mark.parametrize("xml", BROKEN_DOCUMENTS.values(), ids=BROKEN_DOCUMENTS.keys())
+def test_raises_parse_error_on_broken_documents(xml):
+    assert xml != CH
+
+    with pytest.raises(ParseError):
+        parse_timeseries(xml)
