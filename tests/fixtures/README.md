@@ -14,4 +14,8 @@ All price requests used `documentType=A44`, `contract_MarketAgreement.type=A01`,
 
 Sequence 1 is the SDAC day-ahead auction and sequence 2 is the separate EXAA auction. See `docs/decisions.md`.
 
-No real response had position 1 missing or positions missing at the end of a period. Parser tests build those two cases in code by deleting Points from a real fixture, and label them as derived.
+No real response had position 1 missing, positions missing at the end of a period, or a position past the end of its period. `tests/test_parsers.py` builds these three cases in code from `prices_ch_2026-09-23.xml`, and labels them as derived:
+
+- positions 23 and 24 removed (must be filled from position 22)
+- position 1 removed (must raise `ParseError`)
+- position 24 renumbered to 25 (must raise `ParseError`)
