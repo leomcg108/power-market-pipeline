@@ -1,18 +1,47 @@
 # ENTSO-E API request definitions, one per dataset.
 #
-# `params` are sent as query parameters. `{eic}` is replaced by the zone's EIC code
-# from zones.yaml. periodStart and periodEnd are added per request. The token is added
-# by the client and never stored here.
+# `scope` is `zone` (one request per zone) or `border` (one request per border
+# direction in zones.yaml). `params` are sent as query parameters. Placeholders:
+#   {eic}                 the zone's EIC code (zone datasets)
+#   {from_eic}, {to_eic}  the EIC codes of a border's two zones (border datasets)
+# periodStart and periodEnd are added per request. The token is added by the client
+# and never stored here.
 #
 # Source: ENTSO-E Transparency Platform RESTful API guide (Postman collection).
-# Load, generation and flows are added after the Phase 00 spike confirms their
-# parameter names.
+# Parameter names confirmed by the Phase 00 spike (analysis/spike/probe_entsoe.py).
 datasets:
   prices:
     description: Day-ahead prices [12.1.D]
+    scope: zone
     params:
       documentType: A44
       in_Domain: "{eic}"
       out_Domain: "{eic}"
       # A01 = day-ahead. Without it the response can also hold intraday auction prices.
       contract_MarketAgreement.type: A01
+
+  load:
+    description: Actual total load [6.1.A]
+    scope: zone
+    params:
+      documentType: A65
+      processType: A16 # realised
+      outBiddingZone_Domain: "{eic}"
+
+  generation:
+    description: Actual generation per production type [16.1.B&C]
+    scope: zone
+    params:
+      documentType: A75
+      processType: A16 # realised
+      # Series tagged inBiddingZone_Domain are generation. Series tagged
+      # outBiddingZone_Domain are consumption, such as pumped storage pumping.
+      in_Domain: "{eic}"
+
+  flows:
+    description: Cross-border physical flows [12.1.G], one direction per request, not netted
+    scope: border
+    params:
+      documentType: A11
+      out_Domain: "{from_eic}"
+      in_Domain: "{to_eic}"

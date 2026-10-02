@@ -92,6 +92,11 @@ def fetch(
     known_zones = datasets.load_zones()
     if dataset not in known_datasets:
         raise typer.BadParameter(f"choose from {sorted(known_datasets)}", param_hint="--dataset")
+    if known_datasets[dataset].scope != "zone":
+        raise typer.BadParameter(
+            f"{dataset} is requested per border direction, which fetch does not support yet",
+            param_hint="--dataset",
+        )
     if zone not in known_zones:
         raise typer.BadParameter(f"choose from {sorted(known_zones)}", param_hint="--zone")
 
