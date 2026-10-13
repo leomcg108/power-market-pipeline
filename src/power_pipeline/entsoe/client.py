@@ -14,6 +14,9 @@ from power_pipeline import databricks_io
 BASE_URL = "https://web-api.tp.entsoe.eu/api"
 TOKEN_ENV_VAR = "ENTSOE_API_TOKEN"
 TOKEN_SECRET_KEY = "entsoe-api-token"
+# The token travels in this request header, so it is never part of a URL.
+TOKEN_HEADER = "SECURITY_TOKEN"
+# The API also accepts the token as this query parameter. We never send it that way.
 TOKEN_PARAM = "securityToken"
 
 ACKNOWLEDGEMENT_ROOT = "Acknowledgement_MarketDocument"
@@ -22,7 +25,7 @@ NO_DATA_TEXT = "No matching data found"
 
 logger = logging.getLogger(__name__)
 
-# httpx logs every request URL at INFO level, and ENTSO-E URLs carry the token.
+# A second guard: keep HTTP library request logs quiet, whatever they may contain.
 for _name in ("httpx", "httpcore"):
     logging.getLogger(_name).setLevel(logging.WARNING)
 
@@ -133,15 +136,16 @@ def fetch(
 ) -> FetchResult:
     """Send one request and return the body exactly as received.
 
-    An acknowledgement saying "No matching data found" is returned as `no_data`. Any
-    other acknowledgement, HTTP error or network failure raises EntsoeApiError.
-    Messages never contain the token. `request_params` holds the parameters without it.
+    The token is sent in the SECURITY_TOKEN header, never in the URL. An acknowledgement
+    saying "No matching data found" is returned as `no_data`. Any other acknowledgement,
+    HTTP error or network failure raises EntsoeApiError. Messages never contain the
+    token, and `request_params` holds exactly the parameters that were sent.
     """
     if TOKEN_PARAM in params:
         raise ValueError(f"Pass the token separately, not as {TOKEN_PARAM} in params.")
-    query = {**params, TOKEN_PARAM: token}
+    headers = {TOKEN_HEADER: token}
     try:
-        response = (http or httpx).get(BASE_URL, params=query, timeout=timeout_s)
+        response = (http or httpx).get(BASE_URL, params=params, headers=headers, timeout=timeout_s)
     except httpx.TransportError as exc:
         message = f"Request to ENTSO-E failed: {type(exc).__name__}: {exc}"
         raise EntsoeApiError(redact(message, token)) from None
