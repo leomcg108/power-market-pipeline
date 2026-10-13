@@ -145,6 +145,28 @@ def create_append_only_table_sql(table: str, schema: pa.Schema, comment: str) ->
     )
 
 
+def add_missing_columns_sql(table: str, schema: pa.Schema, existing: set[str]) -> str | None:
+    """ALTER TABLE that adds the schema's columns the table does not have yet.
+
+    Returns None when nothing is missing. Adding a column changes only the table's
+    definition, so an append-only table allows it. Existing rows read as NULL.
+    """
+    missing = [field for field in schema if field.name.lower() not in existing]
+    if not missing:
+        return None
+    columns = ", ".join(f"{field.name} {sql_type(field.type)}" for field in missing)
+    return f"ALTER TABLE {table} ADD COLUMNS ({columns})"
+
+
+def table_columns(
+    table: str, warehouse_id: str, *, client: WorkspaceClient | None = None
+) -> set[str]:
+    """Lower-cased column names of a table."""
+    rows = run_sql(f"DESCRIBE TABLE {table}", warehouse_id, client=client)
+    names = (row["col_name"] or "" for row in rows)
+    return {name.lower() for name in names if name and not name.startswith("#")}
+
+
 def copy_into_sql(table: str, source_dir: str, pattern: str) -> str:
     """COPY INTO statement that loads new Parquet files from a volume folder.
 

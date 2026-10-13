@@ -3,9 +3,10 @@ version: 2
 models:
   - name: stg_entsoe__prices
     description: >
-      Day-ahead prices from ENTSO-E at their native resolution, typed and renamed.
-      One row per bronze row. Repeated fetches of the same value are not removed yet.
-      All timestamps are UTC.
+      Day-ahead prices from the SDAC auction at their native resolution, typed and renamed.
+      ENTSO-E also publishes prices from a separate EXAA auction for DE-LU, as sequence 2.
+      Those rows stay in bronze and are left out here. One row per bronze SDAC row.
+      Repeated fetches of the same value are not removed yet. All timestamps are UTC.
     columns:
       - name: zone
         description: Bidding zone code, for example `DE_LU` or `CH`.
@@ -37,6 +38,16 @@ models:
         description: Identifier of the time series inside the document.
       - name: revision_number
         description: ENTSO-E revision number of the document. Higher means newer.
+      - name: classification_sequence
+        description: >
+          ENTSO-E sequence of the price series. 1 is the SDAC day-ahead auction. Empty for
+          zones that publish a single series, such as CH. Never 2, because EXAA rows are
+          left out of this model.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [1]
+                quote: false
       - name: created_datetime_utc
         description: When ENTSO-E created the document, UTC.
       - name: ingested_at_utc

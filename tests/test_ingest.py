@@ -1,6 +1,8 @@
 import gzip
+import json
 from datetime import UTC, date, datetime, timedelta
 from fnmatch import fnmatchcase
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -9,6 +11,8 @@ import pyarrow.parquet as pq
 import pytest
 
 from power_pipeline import ingest
+from power_pipeline.entsoe import client as entsoe
+from power_pipeline.entsoe.parsers import parse_timeseries
 
 WINDOW_START = datetime(2026, 9, 22, 22, 0, tzinfo=UTC)
 WINDOW_END = datetime(2026, 9, 23, 22, 0, tzinfo=UTC)
@@ -105,6 +109,7 @@ def bronze_prices_frame(rows=2):
             "ingested_at_utc": pd.Timestamp(INGESTED_AT),
             "source_file": "/Volumes/workspace/power_raw/landing/entsoe/prices/x.xml.gz",
             "request_params": '{"documentType": "A44"}',
+            "classification_sequence": pd.array([1] * rows, dtype="Int64"),
         }
     )
 
@@ -236,3 +241,205 @@ def test_write_raw_file_never_overwrites(tmp_path):
         ingest.write_raw_file(b"second", path)
 
     assert gzip.decompress(path.read_bytes()) == b"first"
+
+
+FIXTURES = Path(__file__).parent / "fixtures"
+PRICES_DE_LU = (FIXTURES / "prices_de_lu_2026-09-23.xml").read_bytes()
+PRICES_CH = (FIXTURES / "prices_ch_2026-09-23.xml").read_bytes()
+NO_DATA = (FIXTURES / "ack_no_data.xml").read_bytes()
+REQUEST_PARAMS = {"documentType": "A44", "periodStart": "202609222200"}
+RAW_FILE = "/Volumes/workspace/power_raw/landing/entsoe/prices/DE_LU/2026/09/x.xml.gz"
+
+
+def to_bronze(xml=PRICES_DE_LU, **overrides):
+    args = {
+        "dataset": "prices",
+        "zone": "DE_LU",
+        "ingested_at_utc": INGESTED_AT,
+        "source_file": RAW_FILE,
+        "request_params": REQUEST_PARAMS,
+    }
+    return ingest.to_bronze_frame(parse_timeseries(xml), **(args | overrides))
+
+
+def test_bronze_schema_ends_with_the_classification_sequence():
+    assert ingest.BRONZE_PRICES_SCHEMA.names[-1] == "classification_sequence"
+    assert ingest.BRONZE_PRICES_SCHEMA.field("classification_sequence").type == pa.int32()
+
+
+def test_to_bronze_frame_has_exactly_the_bronze_columns():
+    assert list(to_bronze().columns) == ingest.BRONZE_PRICES_SCHEMA.names
+
+
+def test_to_bronze_frame_adds_the_lineage_every_raw_record_must_carry():
+    frame = to_bronze()
+
+    assert len(frame) == 192
+    assert set(frame["dataset"]) == {"prices"}
+    assert set(frame["zone"]) == {"DE_LU"}
+    assert set(frame["ingested_at_utc"]) == {pd.Timestamp(INGESTED_AT)}
+    assert set(frame["source_file"]) == {RAW_FILE}
+    assert [json.loads(params) for params in set(frame["request_params"])] == [REQUEST_PARAMS]
+    assert frame["psr_type"].isna().all()
+    assert frame["unit"].isna().all()
+
+
+def test_to_bronze_frame_keeps_the_parsed_values_and_sequences():
+    parsed = parse_timeseries(PRICES_DE_LU)
+    frame = to_bronze()
+
+    assert frame["value"].tolist() == parsed["value"].tolist()
+    assert frame["classification_sequence"].tolist() == parsed["classification_sequence"].tolist()
+    assert frame["interval_start_utc"].tolist() == parsed["interval_start_utc"].tolist()
+
+
+def test_to_bronze_frame_refuses_request_params_with_a_token():
+    with pytest.raises(ValueError, match="must not contain the token"):
+        to_bronze(request_params={**REQUEST_PARAMS, "securityToken": "secret"})
+
+
+def test_to_bronze_frame_rejects_a_naive_ingestion_time():
+    with pytest.raises(ValueError, match="ingested_at_utc must be timezone-aware"):
+        to_bronze(ingested_at_utc=datetime(2026, 9, 24, 14, 30))
+
+
+@pytest.mark.parametrize(
+    ("xml", "sequences"), [(PRICES_DE_LU, {1, 2}), (PRICES_CH, {None})], ids=["de_lu", "ch"]
+)
+def test_bronze_frame_round_trips_through_parquet(tmp_path, xml, sequences):
+    path = tmp_path / "prices.parquet"
+    frame = to_bronze(xml)
+
+    ingest.write_parquet(frame, path, ingest.BRONZE_PRICES_SCHEMA)
+    table = pq.read_table(path)
+
+    assert table.schema.remove_metadata() == ingest.BRONZE_PRICES_SCHEMA
+    assert table.num_rows == len(frame)
+    assert set(table.column("classification_sequence").to_pylist()) == sequences
+    assert table.column("value").to_pylist() == frame["value"].tolist()
+
+
+def test_ensure_setup_adds_columns_an_existing_table_lacks(monkeypatch):
+    ran = []
+    monkeypatch.setattr(ingest.dbx, "run_sql", lambda sql, wh, client=None: ran.append(sql))
+    existing = set(ingest.BRONZE_PRICES_SCHEMA.names) - {"classification_sequence"}
+    monkeypatch.setattr(ingest.dbx, "table_columns", lambda table, wh, client=None: existing)
+
+    statements = ingest.ensure_setup("wh-1")
+
+    alter = (
+        "ALTER TABLE workspace.power_raw.bronze_prices ADD COLUMNS (classification_sequence INT)"
+    )
+    assert statements == [*ingest.setup_statements(), alter]
+    assert ran == statements
+
+
+def test_ensure_setup_alters_nothing_when_the_table_is_up_to_date(monkeypatch):
+    ran = []
+    monkeypatch.setattr(ingest.dbx, "run_sql", lambda sql, wh, client=None: ran.append(sql))
+    up_to_date = set(ingest.BRONZE_PRICES_SCHEMA.names)
+    monkeypatch.setattr(ingest.dbx, "table_columns", lambda table, wh, client=None: up_to_date)
+
+    assert ingest.ensure_setup("wh-1") == ingest.setup_statements()
+    assert ran == ingest.setup_statements()
+
+
+@pytest.fixture
+def fake_services(monkeypatch):
+    """Replace ENTSO-E and Databricks with fakes that record what ingest_day does."""
+    calls = {"fetch": [], "uploads": [], "loads": [], "response": None}
+
+    def fake_fetch(params, token):
+        calls["fetch"].append((params, token))
+        return calls["response"]
+
+    def fake_upload(local_path, volume_path, client=None):
+        calls["uploads"].append((volume_path, local_path.read_bytes()))
+
+    def fake_load(dataset, warehouse_id, client=None):
+        calls["loads"].append((dataset, warehouse_id))
+        return 192
+
+    monkeypatch.setattr(ingest.entsoe, "fetch", fake_fetch)
+    monkeypatch.setattr(ingest.dbx, "upload_file", fake_upload)
+    monkeypatch.setattr(ingest, "load_bronze", fake_load)
+    return calls
+
+
+def fetch_result(content=PRICES_DE_LU, status="data"):
+    root = "Publication_MarketDocument" if status == "data" else "Acknowledgement_MarketDocument"
+    return entsoe.FetchResult(
+        status=status,
+        http_status=200,
+        root_element=root,
+        content=content,
+        request_params={"documentType": "A44"},
+    )
+
+
+def run_ingest_day(tmp_path, dataset="prices"):
+    return ingest.ingest_day(
+        dataset, "DE_LU", date(2026, 9, 23), token="t", warehouse_id="wh-1", data_dir=tmp_path
+    )
+
+
+def test_ingest_day_requests_the_local_delivery_day(tmp_path, fake_services):
+    fake_services["response"] = fetch_result()
+
+    run_ingest_day(tmp_path)
+
+    [(params, token)] = fake_services["fetch"]
+    assert params["documentType"] == "A44"
+    assert (params["periodStart"], params["periodEnd"]) == ("202609222200", "202609232200")
+    assert token == "t"
+
+
+def test_ingest_day_uploads_raw_then_parquet_and_loads_bronze(tmp_path, fake_services):
+    fake_services["response"] = fetch_result()
+
+    result = run_ingest_day(tmp_path)
+
+    (raw_path, raw_bytes), (parsed_path, parsed_bytes) = fake_services["uploads"]
+    name_start = "20260922T2200Z_20260923T2200Z_"
+    raw_dir = "/Volumes/workspace/power_raw/landing/entsoe/prices/DE_LU/2026/09/"
+    parsed_dir = "/Volumes/workspace/power_raw/landing/parsed/entsoe/prices/DE_LU/2026/09/"
+    assert raw_path.startswith(raw_dir + name_start)
+    assert raw_path.endswith(".xml.gz")
+    assert parsed_path.startswith(parsed_dir + name_start)
+    assert parsed_path.endswith(".parquet")
+    assert gzip.decompress(raw_bytes) == PRICES_DE_LU
+    assert parsed_bytes[:4] == b"PAR1"
+    assert fake_services["loads"] == [("prices", "wh-1")]
+    assert result == ingest.IngestResult("data", 192, 192, raw_path, parsed_path)
+
+
+def test_ingest_day_parquet_rows_point_back_to_the_raw_file(tmp_path, fake_services):
+    fake_services["response"] = fetch_result()
+
+    result = run_ingest_day(tmp_path)
+
+    [parquet_file] = (tmp_path / "parsed").rglob("*.parquet")
+    table = pq.read_table(parquet_file)
+    assert table.num_rows == 192
+    assert set(table.column("source_file").to_pylist()) == {result.raw_volume_path}
+    assert set(table.column("request_params").to_pylist()) == {'{"documentType": "A44"}'}
+    assert set(table.column("classification_sequence").to_pylist()) == {1, 2}
+
+
+def test_ingest_day_keeps_a_no_data_answer_as_raw_only(tmp_path, fake_services):
+    fake_services["response"] = fetch_result(NO_DATA, status="no_data")
+
+    result = run_ingest_day(tmp_path)
+
+    [(raw_path, raw_bytes)] = fake_services["uploads"]
+    assert gzip.decompress(raw_bytes) == NO_DATA
+    assert fake_services["loads"] == []
+    assert result == ingest.IngestResult("no_data", 0, 0, raw_path, None)
+    assert not (tmp_path / "parsed").exists()
+
+
+def test_ingest_day_refuses_a_dataset_without_a_bronze_table(tmp_path, fake_services):
+    with pytest.raises(ValueError, match="no bronze table for load"):
+        run_ingest_day(tmp_path, dataset="load")
+
+    assert fake_services["fetch"] == []

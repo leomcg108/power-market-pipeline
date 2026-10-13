@@ -15,12 +15,17 @@ renamed as (
         cast(unit as string) as unit,
         cast(document_mrid as string) as document_mrid,
         cast(time_series_mrid as string) as time_series_mrid,
+        cast(classification_sequence as int) as classification_sequence,
         cast(revision_number as int) as revision_number,
         cast(created_datetime_utc as timestamp) as created_datetime_utc,
         cast(ingested_at_utc as timestamp) as ingested_at_utc,
         cast(source_file as string) as source_file
     from source
     where {{ start_date_filter('interval_start_utc') }}
+        -- Keep the SDAC day-ahead auction only. ENTSO-E publishes it as sequence 1 and
+        -- the separate EXAA auction as sequence 2. Zones with a single series, such as
+        -- CH, have no sequence.
+        and coalesce(classification_sequence, 1) = 1
 
 )
 

@@ -199,3 +199,33 @@ def test_copy_into_sql():
 def test_sql_builders_refuse_text_with_quotes(text):
     with pytest.raises(ValueError, match="Refusing to quote"):
         databricks_io.create_schema_sql("c.s", text)
+
+
+def test_add_missing_columns_sql_adds_only_what_the_table_lacks():
+    schema = pa.schema([("zone", pa.string()), ("seq", pa.int32()), ("value", pa.float64())])
+
+    sql = databricks_io.add_missing_columns_sql("c.s.t", schema, existing={"zone"})
+
+    assert sql == "ALTER TABLE c.s.t ADD COLUMNS (seq INT, value DOUBLE)"
+
+
+def test_add_missing_columns_sql_returns_none_when_nothing_is_missing():
+    schema = pa.schema([("Zone", pa.string())])
+
+    assert databricks_io.add_missing_columns_sql("c.s.t", schema, existing={"zone"}) is None
+
+
+def test_table_columns_reads_names_and_skips_describe_section_rows():
+    describe_rows = [["zone", "string", None], ["Value", "double", None], ["", "", ""]]
+    describe_rows += [["# Partition Information", "", ""], ["# col_name", "data_type", "comment"]]
+    client = fake_client(
+        statement_response(
+            StatementState.SUCCEEDED,
+            columns=["col_name", "data_type", "comment"],
+            rows=describe_rows,
+        )
+    )
+
+    assert databricks_io.table_columns("c.s.t", "wh-1", client=client) == {"zone", "value"}
+    statement = client.statement_execution.execute_statement.call_args.kwargs["statement"]
+    assert statement == "DESCRIBE TABLE c.s.t"

@@ -2,7 +2,11 @@
 
 A daily data pipeline for European electricity market data. It collects day-ahead prices, electricity demand, generation by source and cross-border flows for Switzerland (CH) and Germany-Luxembourg (DE-LU) from the ENTSO-E Transparency Platform. It stores the data exactly as received, models it with dbt on Databricks and shows it on a dashboard.
 
-The project is in its first phase. The repo holds the tooling and CI so far. The pipeline itself is not built yet.
+## Status
+
+The first phase is done. One day of DE-LU day-ahead prices flows end to end. The pipeline fetches it from ENTSO-E, stores the raw XML and a Parquet file in a Databricks volume, loads a bronze table and builds a dbt staging model on top.
+
+Still to come: the full history from 2024, a daily job, load, generation and flows, the analysis tables and the dashboard.
 
 ## Getting started
 
@@ -105,7 +109,19 @@ Create the raw schema, the landing volume and the bronze tables. The command is 
 uv run power-pipeline setup
 ```
 
-Bronze tables are append-only. Delta rejects any `UPDATE` or `DELETE` on them.
+Bronze tables are append-only. Delta rejects any `UPDATE` or `DELETE` on them. `setup` also adds columns that an existing bronze table lacks.
+
+Fetch one delivery day and load it. This saves the raw XML and a Parquet file locally and in the volume, then loads the Parquet into bronze with `COPY INTO`:
+
+```
+uv run power-pipeline ingest-day --dataset prices --zone DE_LU --date 2026-10-12
+```
+
+`COPY INTO` remembers which files it has loaded. Running the load again adds no rows:
+
+```
+uv run power-pipeline load-bronze --dataset prices
+```
 
 Jobs are defined in `databricks.yml` and deployed as a bundle:
 
