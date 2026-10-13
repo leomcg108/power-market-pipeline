@@ -147,12 +147,15 @@ def test_parse_acknowledgement_returns_none_for_anything_else(content):
 
 
 @respx.mock
-def test_fetch_sends_the_params_and_the_token_as_query_parameters():
+def test_fetch_sends_the_token_as_a_header_and_never_in_the_url():
     route = respx.get(client.BASE_URL).mock(return_value=httpx.Response(200, content=PRICES))
 
     client.fetch(PARAMS, TOKEN)
 
-    assert dict(route.calls.last.request.url.params) == {**PARAMS, "securityToken": TOKEN}
+    request = route.calls.last.request
+    assert request.headers["SECURITY_TOKEN"] == TOKEN
+    assert dict(request.url.params) == PARAMS
+    assert TOKEN not in str(request.url)
 
 
 @respx.mock
@@ -238,14 +241,16 @@ def test_fetch_never_logs_the_token(caplog):
 
 
 @respx.mock
-def test_httpx_would_log_the_token_if_its_logger_were_left_at_info(caplog):
-    # Shows why the client raises the httpx logger to WARNING.
+def test_token_stays_out_of_logs_even_with_http_library_logging_turned_on(caplog):
+    # The token is in a header, not the URL, so request logging cannot leak it.
     respx.get(client.BASE_URL).mock(return_value=httpx.Response(200, content=PRICES))
-    caplog.set_level(logging.INFO, logger="httpx")
+    caplog.set_level(logging.DEBUG, logger="httpx")
+    caplog.set_level(logging.DEBUG, logger="httpcore")
 
     client.fetch(PARAMS, TOKEN)
 
-    assert TOKEN in caplog.text
+    assert "HTTP Request: GET" in caplog.text
+    assert TOKEN not in caplog.text
 
 
 def test_redact_removes_the_token_and_any_token_query_parameter():
