@@ -105,7 +105,19 @@ Create the raw schema, the landing volume and the bronze tables. The command is 
 uv run power-pipeline setup
 ```
 
-Bronze tables are append-only. Delta rejects any `UPDATE` or `DELETE` on them.
+Bronze tables are append-only. Delta rejects any `UPDATE` or `DELETE` on them. `setup` also adds columns that an existing bronze table lacks.
+
+Fetch one delivery day and load it. This saves the raw XML and a Parquet file locally and in the volume, then loads the Parquet into bronze with `COPY INTO`:
+
+```
+uv run power-pipeline ingest-day --dataset prices --zone DE_LU --date 2026-10-12
+```
+
+`COPY INTO` remembers which files it has loaded. Running the load again adds no rows:
+
+```
+uv run power-pipeline load-bronze --dataset prices
+```
 
 Jobs are defined in `databricks.yml` and deployed as a bundle:
 

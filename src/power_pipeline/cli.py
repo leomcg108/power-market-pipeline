@@ -2,12 +2,15 @@
 
 import os
 import platform
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from importlib.metadata import version
 from pathlib import Path
 from typing import Annotated
 
 import typer
+from databricks.sdk.errors import DatabricksError
 from dotenv import find_dotenv, load_dotenv
 
 from power_pipeline import databricks_io, ingest
@@ -17,6 +20,19 @@ app = typer.Typer(
     help="Collect ENTSO-E electricity market data for CH and DE-LU.",
     no_args_is_help=True,
 )
+
+
+@contextmanager
+def report_errors() -> Iterator[None]:
+    """Turn expected ENTSO-E and Databricks failures into one line and exit code 1."""
+    try:
+        yield
+    except (client.MissingTokenError, client.EntsoeApiError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from None
+    except (DatabricksError, databricks_io.SqlError) as exc:
+        typer.echo(f"error: Databricks: {exc}", err=True)
+        raise typer.Exit(code=1) from None
 
 
 @app.callback()
@@ -102,12 +118,9 @@ def fetch(
 
     start, end = ingest.delivery_day_window_utc(delivery_date.date())
     params = datasets.build_params(known_datasets[dataset], known_zones[zone], start, end)
-    try:
+    with report_errors():
         token = client.get_token(secret_scope)
         result = client.fetch(params, token)
-    except (client.MissingTokenError, client.EntsoeApiError) as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=1) from None
 
     relative_path = ingest.landing_relative_path(dataset, zone, start, end, datetime.now(UTC))
     path = ingest.local_raw_path(data_dir, relative_path)
@@ -127,14 +140,80 @@ def setup(
         typer.Option(help="SQL warehouse ID. Defaults to the one in DATABRICKS_HTTP_PATH."),
     ] = None,
 ) -> None:
-    """Create the raw schema, landing volume and bronze tables if they do not exist.
+    """Create the raw schema, landing volume and bronze tables, and add missing columns.
 
-    Safe to run any number of times. Existing objects are left as they are.
+    Safe to run any number of times. Existing data is never changed.
     """
     warehouse_id = warehouse_id or databricks_io.warehouse_id_from_env()
-    for statement in ingest.setup_statements():
-        databricks_io.run_sql(statement, warehouse_id)
+    with report_errors():
+        statements = ingest.ensure_setup(warehouse_id)
+    for statement in statements:
         typer.echo(f"ok: {statement.splitlines()[0]}")
+
+
+@app.command("ingest-day")
+def ingest_day(
+    dataset: Annotated[str, typer.Option(help="Dataset from config/datasets.yaml.")],
+    zone: Annotated[str, typer.Option(help="Zone from config/zones.yaml, for example DE_LU.")],
+    delivery_date: Annotated[
+        datetime,
+        typer.Option("--date", formats=["%Y-%m-%d"], help="Delivery day, local time."),
+    ],
+    secret_scope: Annotated[
+        str | None,
+        typer.Option(help="Secret scope with the ENTSO-E token, if ENTSOE_API_TOKEN is unset."),
+    ] = None,
+    warehouse_id: Annotated[
+        str | None,
+        typer.Option(help="SQL warehouse ID. Defaults to the one in DATABRICKS_HTTP_PATH."),
+    ] = None,
+    data_dir: Annotated[Path, typer.Option(help="Local data folder.")] = Path("data"),
+) -> None:
+    """Fetch one delivery day, store raw XML and Parquet in the volume, and load bronze."""
+    if dataset not in ingest.BRONZE_TABLES:
+        raise typer.BadParameter(
+            f"choose from {sorted(ingest.BRONZE_TABLES)}", param_hint="--dataset"
+        )
+    known_zones = datasets.load_zones()
+    if zone not in known_zones:
+        raise typer.BadParameter(f"choose from {sorted(known_zones)}", param_hint="--zone")
+
+    warehouse_id = warehouse_id or databricks_io.warehouse_id_from_env()
+    with report_errors():
+        result = ingest.ingest_day(
+            dataset,
+            zone,
+            delivery_date.date(),
+            token=client.get_token(secret_scope),
+            warehouse_id=warehouse_id,
+            data_dir=data_dir,
+        )
+
+    typer.echo(f"status: {result.status}")
+    typer.echo(f"raw: {result.raw_volume_path}")
+    if result.parsed_volume_path:
+        typer.echo(f"parsed: {result.parsed_volume_path}")
+    typer.echo(f"rows parsed: {result.rows_parsed}")
+    typer.echo(f"rows loaded into bronze: {result.rows_loaded}")
+
+
+@app.command("load-bronze")
+def load_bronze(
+    dataset: Annotated[str, typer.Option(help="Dataset with a bronze table.")],
+    warehouse_id: Annotated[
+        str | None,
+        typer.Option(help="SQL warehouse ID. Defaults to the one in DATABRICKS_HTTP_PATH."),
+    ] = None,
+) -> None:
+    """Load parsed files that are not in bronze yet. Files already loaded are skipped."""
+    if dataset not in ingest.BRONZE_TABLES:
+        raise typer.BadParameter(
+            f"choose from {sorted(ingest.BRONZE_TABLES)}", param_hint="--dataset"
+        )
+    warehouse_id = warehouse_id or databricks_io.warehouse_id_from_env()
+    with report_errors():
+        rows_loaded = ingest.load_bronze(dataset, warehouse_id)
+    typer.echo(f"rows loaded into bronze: {rows_loaded}")
 
 
 def run_job() -> None:

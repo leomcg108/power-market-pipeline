@@ -42,3 +42,7 @@ sources:
             description: Volume path of the raw XML file this row was parsed from.
           - name: request_params
             description: JSON of the API request parameters, without the token.
+          - name: classification_sequence
+            description: >
+              ENTSO-E sequence of the price series. 1 is the SDAC day-ahead auction and 2 is
+              the separate EXAA auction. Empty for zones with a single series, such as CH.
