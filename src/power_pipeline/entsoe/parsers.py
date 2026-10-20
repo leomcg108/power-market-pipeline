@@ -12,6 +12,9 @@ from lxml import etree
 ACKNOWLEDGEMENT_ROOT = "Acknowledgement_MarketDocument"
 SEQUENCE_TAG = "classificationSequence_AttributeInstanceComponent.position"
 VALUE_TAGS = ("price.amount", "quantity")
+# Prices and flows tag domains one way, load and generation the other.
+IN_DOMAIN_TAGS = ("in_Domain.mRID", "inBiddingZone_Domain.mRID")
+OUT_DOMAIN_TAGS = ("out_Domain.mRID", "outBiddingZone_Domain.mRID")
 
 # No entity expansion and no network access while parsing.
 _XML_PARSER = etree.XMLParser(resolve_entities=False, no_network=True)
@@ -20,6 +23,10 @@ _MINUTE_RESOLUTION = re.compile(r"^PT(\d+)M$")
 PARSED_COLUMNS = [
     "time_series_mrid",
     "classification_sequence",
+    "psr_type",
+    "in_domain",
+    "out_domain",
+    "unit",
     "resolution",
     "interval_start_utc",
     "interval_end_utc",
@@ -42,8 +49,9 @@ def parse_timeseries(xml: bytes) -> pd.DataFrame:
         root element Publication_MarketDocument. Read the XML namespace from the root
         element. It differs between document types and versions, so never hard-code it.
 
-    Document structure for prices (simplified):
-        Publication_MarketDocument
+    Document structure (simplified). Prices and flows use Publication_MarketDocument,
+    load and generation use GL_MarketDocument. The parts read here are the same:
+        <root>
             mRID                       -> document_mrid
             revisionNumber             -> revision_number
             createdDateTime            -> created_datetime_utc, for example 2026-09-24T16:38:57Z
@@ -51,8 +59,19 @@ def parse_timeseries(xml: bytes) -> pd.DataFrame:
                 mRID                   -> time_series_mrid. "1", "2" and so on. Unique only
                                           within one document.
                 classificationSequence_AttributeInstanceComponent.position
-                                       -> classification_sequence. 1 is SDAC, 2 is EXAA.
-                                          The element is missing for CH.
+                                       -> classification_sequence. Prices only: 1 is SDAC,
+                                          2 is EXAA. Missing for CH and other datasets.
+                MktPSRType/psrType     -> psr_type. Generation only, for example B16 solar.
+                in_Domain.mRID or inBiddingZone_Domain.mRID
+                                       -> in_domain. For generation, an in domain means
+                                          generation into the zone.
+                out_Domain.mRID or outBiddingZone_Domain.mRID
+                                       -> out_domain. For generation, an out domain means
+                                          consumption, such as pumped storage pumping.
+                currency_Unit.name and price_Measure_Unit.name
+                                       -> unit, as "EUR/MWH" for prices
+                quantity_Measure_Unit.name
+                                       -> unit, as "MAW" (megawatts) for quantities
                 curveType              A03 means Points can be left out (see the fill rule)
                 Period (one or more)
                     timeInterval/start, timeInterval/end
@@ -60,8 +79,8 @@ def parse_timeseries(xml: bytes) -> pd.DataFrame:
                     resolution         PT15M or PT60M
                     Point (one or more)
                         position       1-based index of the interval in the period
-                        price.amount   -> value. Quantity documents (Phase 01) use
-                                          `quantity` instead.
+                        price.amount   -> value for prices
+                        quantity       -> value for load, generation and flows
 
     The fill rule (data rule 5):
         A period has (end - start) / resolution intervals. That is 96 for a day at PT15M,
@@ -80,6 +99,10 @@ def parse_timeseries(xml: bytes) -> pd.DataFrame:
         - revision_number has an integer dtype.
         - classification_sequence has the nullable integer dtype "Int64", <NA> if absent.
         - time_series_mrid, resolution and document_mrid hold strings.
+        - psr_type, in_domain, out_domain and unit hold strings, missing where the
+          document has no such element.
+        - Two Periods with a gap between them leave the gap out. The fill rule works
+          only inside a Period.
         An Acknowledgement_MarketDocument, which is ENTSO-E's "no data" reply, gives an
         empty DataFrame with the same columns.
 
@@ -108,6 +131,10 @@ def parse_timeseries(xml: bytes) -> pd.DataFrame:
         time_series_mrid = doc.text(series, "mRID")
         sequence = doc.text(series, SEQUENCE_TAG, required=False)
         classification_sequence = int(sequence) if sequence is not None else None
+        psr_type = doc.text(series, "MktPSRType/psrType", required=False)
+        in_domain = _first_text(doc, series, IN_DOMAIN_TAGS)
+        out_domain = _first_text(doc, series, OUT_DOMAIN_TAGS)
+        unit = _unit(doc, series)
 
         for period in doc.all(series, "Period"):
             period_start = _utc_time(doc.text(period, "timeInterval/start"))
@@ -125,6 +152,10 @@ def parse_timeseries(xml: bytes) -> pd.DataFrame:
                     (
                         time_series_mrid,
                         classification_sequence,
+                        psr_type,
+                        in_domain,
+                        out_domain,
+                        unit,
                         resolution,
                         interval_start,
                         interval_start + step,
@@ -199,6 +230,27 @@ def _read_points(
     return points
 
 
+def _first_text(doc: _Reader, element, tags: tuple[str, ...]) -> str | None:
+    """Text of the first of `tags` present on the element, or None."""
+    for tag in tags:
+        value = doc.text(element, tag, required=False)
+        if value is not None:
+            return value
+    return None
+
+
+def _unit(doc: _Reader, series) -> str | None:
+    """Unit of a series' values: "EUR/MWH" for prices, "MAW" for quantities."""
+    quantity_unit = doc.text(series, "quantity_Measure_Unit.name", required=False)
+    if quantity_unit is not None:
+        return quantity_unit
+    currency = doc.text(series, "currency_Unit.name", required=False)
+    measure = doc.text(series, "price_Measure_Unit.name", required=False)
+    if currency is not None and measure is not None:
+        return f"{currency}/{measure}"
+    return None
+
+
 def _point_value(doc: _Reader, point) -> float:
     for tag in VALUE_TAGS:
         value = doc.text(point, tag, required=False)
@@ -229,6 +281,10 @@ def _to_frame(rows: list[tuple]) -> pd.DataFrame:
         {
             "time_series_mrid": pd.Series(columns["time_series_mrid"], dtype=str),
             "classification_sequence": pd.array(columns["classification_sequence"], dtype="Int64"),
+            "psr_type": pd.Series(columns["psr_type"], dtype=str),
+            "in_domain": pd.Series(columns["in_domain"], dtype=str),
+            "out_domain": pd.Series(columns["out_domain"], dtype=str),
+            "unit": pd.Series(columns["unit"], dtype=str),
             "resolution": pd.Series(columns["resolution"], dtype=str),
             "interval_start_utc": pd.to_datetime(columns["interval_start_utc"], utc=True),
             "interval_end_utc": pd.to_datetime(columns["interval_end_utc"], utc=True),

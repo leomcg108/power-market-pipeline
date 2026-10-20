@@ -281,7 +281,7 @@ def test_to_bronze_frame_adds_the_lineage_every_raw_record_must_carry():
     assert set(frame["source_file"]) == {RAW_FILE}
     assert [json.loads(params) for params in set(frame["request_params"])] == [REQUEST_PARAMS]
     assert frame["psr_type"].isna().all()
-    assert frame["unit"].isna().all()
+    assert set(frame["unit"]) == {"EUR/MWH"}
 
 
 def test_to_bronze_frame_keeps_the_parsed_values_and_sequences():
