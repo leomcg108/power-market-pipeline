@@ -296,3 +296,153 @@ def test_raises_parse_error_on_broken_documents(xml):
 
     with pytest.raises(ParseError):
         parse_timeseries(xml)
+
+
+# Load, generation and flows. Fixtures are real responses for 2026-09-23. The DE-LU
+# generation file is trimmed to five series. See tests/fixtures/README.md.
+
+LOAD_DE_LU = (FIXTURES / "load_de_lu_2026-09-23.xml").read_bytes()
+GENERATION_CH = (FIXTURES / "generation_ch_2026-09-23.xml").read_bytes()
+GENERATION_DE_LU = (FIXTURES / "generation_de_lu_2026-09-23_trimmed.xml").read_bytes()
+FLOWS_CH_DE_LU = (FIXTURES / "flows_ch_de_lu_2026-09-23.xml").read_bytes()
+QUANTITY_DOCUMENTS = {
+    "load_de_lu": LOAD_DE_LU,
+    "generation_ch": GENERATION_CH,
+    "generation_de_lu": GENERATION_DE_LU,
+    "flows_ch_de_lu": FLOWS_CH_DE_LU,
+}
+CH_EIC = "10YCH-SWISSGRIDZ"
+DE_LU_EIC = "10Y1001A1001A82H"
+
+
+def by_psr_type(frame: pd.DataFrame, psr_type: str) -> pd.DataFrame:
+    rows = frame[frame["psr_type"] == psr_type]
+    return rows.sort_values(["time_series_mrid", "interval_start_utc"]).reset_index(drop=True)
+
+
+@pytest.mark.parametrize("xml", QUANTITY_DOCUMENTS.values(), ids=QUANTITY_DOCUMENTS.keys())
+def test_quantity_documents_have_the_columns_and_megawatt_units(xml):
+    frame = parse_timeseries(xml)
+
+    assert list(frame.columns) == PARSED_COLUMNS
+    assert set(frame["unit"]) == {"MAW"}
+    assert frame["classification_sequence"].isna().all()
+
+
+@pytest.mark.parametrize("xml", QUANTITY_DOCUMENTS.values(), ids=QUANTITY_DOCUMENTS.keys())
+def test_quantity_documents_have_one_row_per_interval_per_series(xml):
+    frame = parse_timeseries(xml)
+    steps = frame["resolution"].map(STEPS)
+
+    assert not frame.duplicated(["time_series_mrid", "interval_start_utc"]).any()
+    assert (frame["interval_end_utc"] - frame["interval_start_utc"] == steps).all()
+
+
+@pytest.mark.parametrize(
+    "xml",
+    [*PRICE_DOCUMENTS.values(), *QUANTITY_DOCUMENTS.values()],
+    ids=[*PRICE_DOCUMENTS, *QUANTITY_DOCUMENTS],
+)
+def test_new_text_columns_hold_strings_or_are_missing(xml):
+    frame = parse_timeseries(xml)
+
+    for column in ("psr_type", "in_domain", "out_domain", "unit"):
+        assert all(isinstance(item, str) or pd.isna(item) for item in frame[column]), column
+
+
+def test_prices_carry_their_unit_and_both_domains():
+    frame = parse_timeseries(DE_LU_2026)
+
+    assert set(frame["unit"]) == {"EUR/MWH"}
+    assert set(frame["in_domain"]) == {DE_LU_EIC}
+    assert set(frame["out_domain"]) == {DE_LU_EIC}
+    assert frame["psr_type"].isna().all()
+
+
+def test_load_is_one_quarter_hourly_series_tagged_with_the_out_domain():
+    frame = parse_timeseries(LOAD_DE_LU)
+
+    assert len(frame) == 96
+    assert set(frame["resolution"]) == {"PT15M"}
+    assert set(frame["out_domain"]) == {DE_LU_EIC}
+    assert frame["in_domain"].isna().all()
+    assert frame["psr_type"].isna().all()
+    assert frame["value"].min() == 43830.63256
+    assert frame["value"].max() == 62836.65418
+
+
+def test_generation_has_one_hourly_series_per_production_type():
+    frame = parse_timeseries(GENERATION_CH)
+
+    assert len(frame) == 6 * 24
+    assert frame.groupby("psr_type").size().to_dict() == {
+        "B10": 24,
+        "B11": 24,
+        "B12": 24,
+        "B14": 24,
+        "B16": 24,
+        "B19": 24,
+    }
+    assert set(frame["resolution"]) == {"PT60M"}
+    assert set(frame["in_domain"]) == {CH_EIC}
+    assert frame["out_domain"].isna().all()
+
+
+def test_omitted_night_time_zeros_are_filled():
+    # CH solar sends 15 of 24 Points. The repeated night-time zeros are left out.
+    solar = by_psr_type(parse_timeseries(GENERATION_CH), "B16")
+
+    assert len(solar) == 24
+    assert (solar["value"] == 0).sum() == 11
+    assert solar["value"].max() == 3167.783447
+
+
+def test_generation_and_consumption_are_told_apart_by_domain():
+    # DE-LU pumped storage (B10) has two series: generation tagged with the in domain,
+    # and pumping consumption tagged with the out domain.
+    pumped = by_psr_type(parse_timeseries(GENERATION_DE_LU), "B10")
+    generation = pumped[pumped["in_domain"] == DE_LU_EIC]
+    consumption = pumped[pumped["out_domain"] == DE_LU_EIC]
+
+    assert len(generation) == 96
+    assert len(consumption) == 96
+    assert generation["out_domain"].isna().all()
+    assert consumption["in_domain"].isna().all()
+    assert set(generation["time_series_mrid"]) != set(consumption["time_series_mrid"])
+
+
+def test_a_gap_between_periods_stays_missing():
+    # DE-LU waste (B17) has two Periods, 22:00 to 07:45 and 08:00 to 22:00 UTC.
+    waste = by_psr_type(parse_timeseries(GENERATION_DE_LU), "B17")
+    starts = set(waste["interval_start_utc"])
+
+    assert len(waste) == 95
+    assert utc(2026, 9, 23, 7, 30) in starts
+    assert utc(2026, 9, 23, 7, 45) not in starts
+    assert utc(2026, 9, 23, 8, 0) in starts
+
+
+def test_a_series_with_one_point_repeats_it_all_day():
+    # DE-LU geothermal (B09) sends a single Point for the whole day.
+    geothermal = by_psr_type(parse_timeseries(GENERATION_DE_LU), "B09")
+
+    assert len(geothermal) == 96
+    assert set(geothermal["value"]) == {19.00702}
+
+
+def test_flows_record_their_direction_in_the_domains():
+    frame = parse_timeseries(FLOWS_CH_DE_LU)
+
+    assert len(frame) == 96
+    assert set(frame["out_domain"]) == {CH_EIC}
+    assert set(frame["in_domain"]) == {DE_LU_EIC}
+    assert frame["psr_type"].isna().all()
+    assert set(frame["resolution"]) == {"PT15M"}
+
+
+def test_flows_keep_zero_values_including_omitted_repeats():
+    # CH to DE-LU sends 92 of 96 Points. Some of the left-out Points repeat a zero.
+    frame = parse_timeseries(FLOWS_CH_DE_LU)
+
+    assert (frame["value"] == 0).sum() == 7
+    assert frame["value"].max() == 3176.15002

@@ -198,20 +198,17 @@ def to_bronze_frame(
     ingested_at_utc: datetime,
     source_file: str,
     request_params: dict[str, str],
-    unit: str | None = None,
 ) -> pd.DataFrame:
     """Add the columns every raw record must carry (data rule 2) to the parser's output.
 
-    `source_file` is the volume path of the raw XML the rows came from. `unit` stays
-    empty until the parser reads units from the XML in Phase 01.
+    `source_file` is the volume path of the raw XML the rows came from. `psr_type` and
+    `unit` come from the parser, which reads them from the XML.
     """
     if entsoe.TOKEN_PARAM in request_params:
         raise ValueError("request_params must not contain the token.")
     frame = parsed.copy()
     frame["dataset"] = dataset
     frame["zone"] = zone
-    frame["psr_type"] = None
-    frame["unit"] = unit
     frame["ingested_at_utc"] = pd.Timestamp(_as_utc(ingested_at_utc, "ingested_at_utc"))
     frame["source_file"] = source_file
     frame["request_params"] = json.dumps(request_params, sort_keys=True)
