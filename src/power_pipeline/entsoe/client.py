@@ -3,11 +3,20 @@
 import logging
 import os
 import re
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
 import httpx
 from lxml import etree
+from tenacity import (
+    RetryCallState,
+    Retrying,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential_jitter,
+)
 
 from power_pipeline import databricks_io
 
@@ -22,6 +31,15 @@ TOKEN_PARAM = "securityToken"
 ACKNOWLEDGEMENT_ROOT = "Acknowledgement_MarketDocument"
 NO_DATA_REASON_CODE = "999"
 NO_DATA_TEXT = "No matching data found"
+
+# Tries per request, counting the first. Retries happen on HTTP 429, HTTP 5xx and
+# network errors, with exponential backoff, or the wait the server asks for.
+MAX_ATTEMPTS = 5
+MAX_RETRY_AFTER_S = 600.0
+# ENTSO-E allows 400 requests a minute per token. Two a second stays well under it.
+MIN_REQUEST_INTERVAL_S = 0.5
+# The API returns at most this many TimeSeries per response and cuts off the rest.
+MAX_TIME_SERIES = 100
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +57,47 @@ class MissingTokenError(RuntimeError):
 
 
 class EntsoeApiError(RuntimeError):
-    """The request failed, or the API answered with an error. Never holds the token."""
+    """The request failed, or the API answered with an error. Never holds the token.
+
+    `http_status` and `content` hold the last response, when there was one, so the
+    caller can keep the raw body.
+    """
+
+    def __init__(
+        self, message: str, *, http_status: int | None = None, content: bytes | None = None
+    ):
+        super().__init__(message)
+        self.http_status = http_status
+        self.content = content
+
+
+class RateLimiter:
+    """Keeps at least `min_interval_s` between requests made through it."""
+
+    def __init__(
+        self,
+        min_interval_s: float,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ):
+        self.min_interval_s = min_interval_s
+        self._clock = clock
+        self._sleep = sleep
+        self._last: float | None = None
+
+    def wait(self) -> None:
+        now = self._clock()
+        if self._last is not None:
+            delay = self._last + self.min_interval_s - now
+            if delay > 0:
+                self._sleep(delay)
+                now += delay
+        self._last = now
+
+
+# Shared by every request in this process. Tests replace both with instant versions.
+_rate_limiter = RateLimiter(MIN_REQUEST_INTERVAL_S)
+_sleep: Callable[[float], None] = time.sleep
 
 
 def get_token(secret_scope: str | None = None) -> str:
@@ -127,51 +185,156 @@ class FetchResult:
     request_params: dict[str, str]
 
 
+class _RetryableResponse(Exception):
+    """An HTTP answer worth retrying: 429 Too Many Requests or a 5xx server error."""
+
+    def __init__(self, response: httpx.Response):
+        super().__init__(f"HTTP {response.status_code}")
+        self.response = response
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    return isinstance(exc, (_RetryableResponse, httpx.TransportError))
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    """The Retry-After header in seconds, if the server sent one in that form."""
+    try:
+        return min(max(float(response.headers["retry-after"]), 0.0), MAX_RETRY_AFTER_S)
+    except (KeyError, ValueError):
+        return None
+
+
+_backoff = wait_exponential_jitter(initial=1, max=60)
+
+
+def _wait_before_retry(state: RetryCallState) -> float:
+    exc = state.outcome.exception() if state.outcome else None
+    if isinstance(exc, _RetryableResponse):
+        retry_after = _retry_after_seconds(exc.response)
+        if retry_after is not None:
+            return retry_after
+    return _backoff(state)
+
+
+def _log_retry(state: RetryCallState, max_attempts: int) -> None:
+    exc = state.outcome.exception() if state.outcome else None
+    reason = str(exc) if isinstance(exc, _RetryableResponse) else type(exc).__name__
+    wait_s = state.next_action.sleep if state.next_action else 0.0
+    logger.warning(
+        "ENTSO-E request failed (%s). Retrying in %.1f s, attempt %d of %d.",
+        reason,
+        wait_s,
+        state.attempt_number + 1,
+        max_attempts,
+    )
+
+
+def _send(
+    params: dict[str, str],
+    token: str,
+    http: httpx.Client | None,
+    timeout_s: float,
+    max_attempts: int,
+    rate_limiter: RateLimiter,
+    sleep: Callable[[float], None],
+) -> httpx.Response:
+    """GET with rate limiting and retries. Raises the last error when tries run out."""
+    retrying = Retrying(
+        stop=stop_after_attempt(max_attempts),
+        wait=_wait_before_retry,
+        retry=retry_if_exception(_is_retryable),
+        sleep=sleep,
+        before_sleep=lambda state: _log_retry(state, max_attempts),
+        reraise=True,
+    )
+    for attempt in retrying:
+        with attempt:
+            rate_limiter.wait()
+            response = (http or httpx).get(
+                BASE_URL, params=params, headers={TOKEN_HEADER: token}, timeout=timeout_s
+            )
+            if response.status_code == 429 or response.status_code >= 500:
+                raise _RetryableResponse(response)
+            return response
+    raise AssertionError("unreachable: tenacity re-raises the last error")
+
+
+def _time_series_count(root: etree._Element) -> int:
+    return sum(1 for child in root if etree.QName(child).localname == "TimeSeries")
+
+
 def fetch(
     params: dict[str, str],
     token: str,
     *,
     http: httpx.Client | None = None,
     timeout_s: float = 60.0,
+    max_attempts: int = MAX_ATTEMPTS,
+    rate_limiter: RateLimiter | None = None,
+    sleep: Callable[[float], None] | None = None,
 ) -> FetchResult:
     """Send one request and return the body exactly as received.
 
-    The token is sent in the SECURITY_TOKEN header, never in the URL. An acknowledgement
-    saying "No matching data found" is returned as `no_data`. Any other acknowledgement,
-    HTTP error or network failure raises EntsoeApiError. Messages never contain the
-    token, and `request_params` holds exactly the parameters that were sent.
+    The token is sent in the SECURITY_TOKEN header, never in the URL. Requests are spaced
+    by the shared rate limiter. HTTP 429, HTTP 5xx and network errors are retried with
+    backoff, up to `max_attempts` tries. An acknowledgement saying "No matching data
+    found" is returned as `no_data`. Any other acknowledgement, a remaining HTTP error,
+    a network failure or a response that may be cut off raises EntsoeApiError. Messages
+    never contain the token, and `request_params` holds exactly the parameters sent.
     """
     if TOKEN_PARAM in params:
         raise ValueError(f"Pass the token separately, not as {TOKEN_PARAM} in params.")
-    headers = {TOKEN_HEADER: token}
     try:
-        response = (http or httpx).get(BASE_URL, params=params, headers=headers, timeout=timeout_s)
+        response = _send(
+            params,
+            token,
+            http,
+            timeout_s,
+            max_attempts,
+            rate_limiter or _rate_limiter,
+            sleep or _sleep,
+        )
+    except _RetryableResponse as exc:
+        response = exc.response  # tries used up: report it below like any HTTP error
     except httpx.TransportError as exc:
         message = f"Request to ENTSO-E failed: {type(exc).__name__}: {exc}"
         raise EntsoeApiError(redact(message, token)) from None
 
-    content = response.content
+    status, content = response.status_code, response.content
     root = _parse_xml(content)
     acknowledgement = None if root is None else _read_acknowledgement(root)
     if acknowledgement is not None:
         if acknowledgement.is_no_data:
             return FetchResult(
                 status="no_data",
-                http_status=response.status_code,
+                http_status=status,
                 root_element=ACKNOWLEDGEMENT_ROOT,
                 content=content,
                 request_params=dict(params),
             )
-        message = f"HTTP {response.status_code}, acknowledgement {acknowledgement.describe()}"
-        raise EntsoeApiError(redact(message, token))
-    if response.status_code != 200:
+        message = f"HTTP {status}, acknowledgement {acknowledgement.describe()}"
+        raise EntsoeApiError(redact(message, token), http_status=status, content=content)
+    if status != 200:
         snippet = " ".join(response.text[:200].split())
-        raise EntsoeApiError(redact(f"HTTP {response.status_code}: {snippet!r}", token))
+        raise EntsoeApiError(
+            redact(f"HTTP {status}: {snippet!r}", token), http_status=status, content=content
+        )
     if root is None:
-        raise EntsoeApiError("HTTP 200, but the response is not XML.")
+        raise EntsoeApiError(
+            "HTTP 200, but the response is not XML.", http_status=status, content=content
+        )
+    series_count = _time_series_count(root)
+    if series_count >= MAX_TIME_SERIES:
+        raise EntsoeApiError(
+            f"The response holds {series_count} TimeSeries, the API maximum, so it may be "
+            "cut off. Request a shorter window.",
+            http_status=status,
+            content=content,
+        )
     return FetchResult(
         status="data",
-        http_status=response.status_code,
+        http_status=status,
         root_element=etree.QName(root).localname,
         content=content,
         request_params=dict(params),
