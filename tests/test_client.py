@@ -1,9 +1,11 @@
+import copy
 import logging
 from pathlib import Path
 
 import httpx
 import pytest
 import respx
+from lxml import etree
 
 from power_pipeline.entsoe import client
 
@@ -11,6 +13,7 @@ FIXTURES = Path(__file__).parent / "fixtures"
 AUTH_FAILED = (FIXTURES / "ack_authentication_failed.xml").read_bytes()
 NO_DATA = (FIXTURES / "ack_no_data.xml").read_bytes()
 PRICES = (FIXTURES / "prices_de_lu_2026-09-23.xml").read_bytes()
+PRICES_CH = (FIXTURES / "prices_ch_2026-09-23.xml").read_bytes()
 
 TOKEN = "11111111-2222-3333-4444-555555555555"
 PARAMS = {
@@ -257,3 +260,222 @@ def test_redact_removes_the_token_and_any_token_query_parameter():
     text = f"token {TOKEN} and url ?a=1&securityToken=other-token&b=2"
 
     assert client.redact(text, TOKEN) == "token *** and url ?a=1&securityToken=***&b=2"
+
+
+# Retries
+
+
+class RecordingSleep:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, seconds):
+        self.calls.append(seconds)
+
+
+@respx.mock
+@pytest.mark.parametrize("first_status", [429, 500, 502, 503, 504])
+def test_fetch_retries_rate_limits_and_server_errors(first_status):
+    route = respx.get(client.BASE_URL).mock(
+        side_effect=[httpx.Response(first_status, text="busy"), httpx.Response(200, content=PRICES)]
+    )
+    sleep = RecordingSleep()
+
+    result = client.fetch(PARAMS, TOKEN, sleep=sleep)
+
+    assert result.status == "data"
+    assert route.call_count == 2
+    assert len(sleep.calls) == 1
+
+
+@respx.mock
+def test_fetch_waits_as_long_as_retry_after_asks():
+    respx.get(client.BASE_URL).mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": "7"}),
+            httpx.Response(200, content=PRICES),
+        ]
+    )
+    sleep = RecordingSleep()
+
+    client.fetch(PARAMS, TOKEN, sleep=sleep)
+
+    assert sleep.calls == [7.0]
+
+
+@respx.mock
+def test_fetch_backs_off_exponentially_without_retry_after():
+    respx.get(client.BASE_URL).mock(
+        side_effect=[httpx.Response(503)] * 3 + [httpx.Response(200, content=PRICES)]
+    )
+    sleep = RecordingSleep()
+
+    client.fetch(PARAMS, TOKEN, sleep=sleep)
+
+    # About 1, 2 and 4 seconds, each plus up to 1 second of random jitter.
+    assert len(sleep.calls) == 3
+    for base, waited in zip([1, 2, 4], sleep.calls, strict=True):
+        assert base <= waited <= base + 1
+
+
+@respx.mock
+def test_fetch_gives_up_after_max_attempts_and_keeps_the_last_response():
+    route = respx.get(client.BASE_URL).mock(return_value=httpx.Response(503, text="maintenance"))
+
+    with pytest.raises(client.EntsoeApiError, match="HTTP 503") as exc_info:
+        client.fetch(PARAMS, TOKEN, max_attempts=3)
+
+    assert route.call_count == 3
+    assert exc_info.value.http_status == 503
+    assert exc_info.value.content == b"maintenance"
+
+
+@respx.mock
+def test_fetch_retries_network_errors():
+    respx.get(client.BASE_URL).mock(
+        side_effect=[httpx.ConnectTimeout("slow"), httpx.Response(200, content=PRICES)]
+    )
+
+    assert client.fetch(PARAMS, TOKEN).status == "data"
+
+
+@respx.mock
+def test_fetch_gives_up_on_persistent_network_errors():
+    route = respx.get(client.BASE_URL).mock(side_effect=httpx.ConnectError("down"))
+
+    with pytest.raises(client.EntsoeApiError, match="ConnectError"):
+        client.fetch(PARAMS, TOKEN, max_attempts=4)
+
+    assert route.call_count == 4
+
+
+@respx.mock
+@pytest.mark.parametrize(("status", "content"), [(401, AUTH_FAILED), (400, b"bad request")])
+def test_fetch_does_not_retry_client_errors(status, content):
+    route = respx.get(client.BASE_URL).mock(return_value=httpx.Response(status, content=content))
+
+    with pytest.raises(client.EntsoeApiError):
+        client.fetch(PARAMS, TOKEN)
+
+    assert route.call_count == 1
+
+
+@respx.mock
+def test_fetch_does_not_retry_a_no_data_answer():
+    route = respx.get(client.BASE_URL).mock(return_value=httpx.Response(400, content=NO_DATA))
+
+    assert client.fetch(PARAMS, TOKEN).status == "no_data"
+    assert route.call_count == 1
+
+
+@respx.mock
+def test_errors_keep_the_status_and_body_for_raw_storage():
+    respx.get(client.BASE_URL).mock(return_value=httpx.Response(401, content=AUTH_FAILED))
+
+    with pytest.raises(client.EntsoeApiError) as exc_info:
+        client.fetch(PARAMS, TOKEN)
+
+    assert exc_info.value.http_status == 401
+    assert exc_info.value.content == AUTH_FAILED
+
+
+@respx.mock
+def test_retry_logs_say_what_failed_without_the_token(caplog):
+    respx.get(client.BASE_URL).mock(
+        side_effect=[httpx.Response(503), httpx.Response(200, content=PRICES)]
+    )
+    caplog.set_level(logging.DEBUG)
+
+    client.fetch(PARAMS, TOKEN)
+
+    assert "ENTSO-E request failed (HTTP 503). Retrying in" in caplog.text
+    assert "attempt 2 of 5" in caplog.text
+    assert TOKEN not in caplog.text
+
+
+# Rate limiting
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 100.0
+        self.slept = []
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+        self.now += seconds
+
+
+def test_rate_limiter_spaces_requests():
+    clock = FakeClock()
+    limiter = client.RateLimiter(0.5, clock=clock, sleep=clock.sleep)
+
+    limiter.wait()  # first request: no wait
+    clock.now += 0.2
+    limiter.wait()  # 0.2 s later: waits the remaining 0.3 s
+    clock.now += 1.0
+    limiter.wait()  # 1 s later: no wait
+
+    assert clock.slept == [pytest.approx(0.3)]
+
+
+def test_rate_limiter_with_zero_interval_never_waits():
+    clock = FakeClock()
+    limiter = client.RateLimiter(0, clock=clock, sleep=clock.sleep)
+
+    for _ in range(3):
+        limiter.wait()
+
+    assert clock.slept == []
+
+
+@respx.mock
+def test_fetch_goes_through_the_rate_limiter_on_every_try():
+    respx.get(client.BASE_URL).mock(
+        side_effect=[httpx.Response(503), httpx.Response(200, content=PRICES)]
+    )
+    waits = []
+
+    class CountingLimiter:
+        def wait(self):
+            waits.append(True)
+
+    client.fetch(PARAMS, TOKEN, rate_limiter=CountingLimiter())
+
+    assert len(waits) == 2
+
+
+def test_default_request_spacing_stays_well_under_the_api_limit():
+    requests_per_minute = 60 / client.MIN_REQUEST_INTERVAL_S
+
+    assert requests_per_minute <= 200  # ENTSO-E allows 400 a minute per token
+
+
+# Truncation guard
+
+
+def with_time_series(count: int) -> bytes:
+    """Derived: the real CH price document with its one TimeSeries copied `count` times."""
+    root = etree.fromstring(PRICES_CH)
+    [series] = [child for child in root if etree.QName(child).localname == "TimeSeries"]
+    for _ in range(count - 1):
+        root.append(copy.deepcopy(series))
+    return etree.tostring(root, xml_declaration=True, encoding="UTF-8")
+
+
+@respx.mock
+def test_fetch_refuses_a_response_that_may_be_cut_off():
+    respx.get(client.BASE_URL).mock(return_value=httpx.Response(200, content=with_time_series(100)))
+
+    with pytest.raises(client.EntsoeApiError, match="100 TimeSeries, the API maximum"):
+        client.fetch(PARAMS, TOKEN)
+
+
+@respx.mock
+def test_fetch_accepts_a_response_below_the_limit():
+    respx.get(client.BASE_URL).mock(return_value=httpx.Response(200, content=with_time_series(99)))
+
+    assert client.fetch(PARAMS, TOKEN).status == "data"
