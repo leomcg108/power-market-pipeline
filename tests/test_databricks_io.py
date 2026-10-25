@@ -1,4 +1,6 @@
+from datetime import UTC, datetime
 from unittest.mock import MagicMock
+from zoneinfo import ZoneInfo
 
 import pyarrow as pa
 import pytest
@@ -229,3 +231,55 @@ def test_table_columns_reads_names_and_skips_describe_section_rows():
     assert databricks_io.table_columns("c.s.t", "wh-1", client=client) == {"zone", "value"}
     statement = client.statement_execution.execute_statement.call_args.kwargs["statement"]
     assert statement == "DESCRIBE TABLE c.s.t"
+
+
+def test_sql_parameters_types_each_value():
+    items = databricks_io.sql_parameters(
+        {
+            "name": "prices",
+            "count": 96,
+            "seconds": 1.5,
+            "at": datetime(2026, 10, 11, 22, 0, tzinfo=UTC),
+            "missing": None,
+        }
+    )
+
+    assert [item.as_dict() for item in items] == [
+        {"name": "name", "value": "prices", "type": "STRING"},
+        {"name": "count", "value": "96", "type": "BIGINT"},
+        {"name": "seconds", "value": "1.5", "type": "DOUBLE"},
+        {"name": "at", "value": "2026-10-11T22:00:00+00:00", "type": "TIMESTAMP"},
+        {"name": "missing", "type": "STRING"},
+    ]
+
+
+def test_sql_parameters_send_timestamps_in_utc():
+    zurich = datetime(2026, 10, 12, 0, 0, tzinfo=ZoneInfo("Europe/Zurich"))
+
+    [item] = databricks_io.sql_parameters({"at": zurich})
+
+    assert item.value == "2026-10-11T22:00:00+00:00"
+
+
+def test_sql_parameters_reject_naive_timestamps_and_booleans():
+    with pytest.raises(ValueError, match="timezone-aware"):
+        databricks_io.sql_parameters({"at": datetime(2026, 10, 12)})
+    with pytest.raises(TypeError, match="booleans"):
+        databricks_io.sql_parameters({"flag": True})
+
+
+def test_run_sql_sends_named_parameters():
+    client = fake_client(statement_response(StatementState.SUCCEEDED))
+
+    databricks_io.run_sql("SELECT :n", "wh-1", parameters={"n": 7}, client=client)
+
+    [item] = client.statement_execution.execute_statement.call_args.kwargs["parameters"]
+    assert item.as_dict() == {"name": "n", "value": "7", "type": "BIGINT"}
+
+
+def test_run_sql_sends_no_parameters_when_there_are_none():
+    client = fake_client(statement_response(StatementState.SUCCEEDED))
+
+    databricks_io.run_sql("SELECT 1", "wh-1", client=client)
+
+    assert client.statement_execution.execute_statement.call_args.kwargs["parameters"] is None

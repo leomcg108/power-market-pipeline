@@ -110,6 +110,8 @@ def bronze_prices_frame(rows=2):
             "source_file": "/Volumes/workspace/power_raw/landing/entsoe/prices/x.xml.gz",
             "request_params": '{"documentType": "A44"}',
             "classification_sequence": pd.array([1] * rows, dtype="Int64"),
+            "in_domain": "10Y1001A1001A82H",
+            "out_domain": "10Y1001A1001A82H",
         }
     )
 
@@ -158,20 +160,37 @@ def test_write_parquet_rejects_timestamps_in_other_time_zones(tmp_path):
         ingest.write_parquet(frame, tmp_path / "x.parquet", ingest.BRONZE_PRICES_SCHEMA)
 
 
-def test_setup_statements_create_schema_then_volume_then_bronze_table():
-    schema_sql, volume_sql, table_sql = ingest.setup_statements()
+def test_setup_statements_create_schema_volume_bronze_tables_then_log():
+    statements = ingest.setup_statements()
 
-    assert schema_sql.startswith("CREATE SCHEMA IF NOT EXISTS workspace.power_raw ")
-    assert volume_sql.startswith("CREATE VOLUME IF NOT EXISTS workspace.power_raw.landing ")
-    assert table_sql.startswith("CREATE TABLE IF NOT EXISTS workspace.power_raw.bronze_prices (")
+    assert [s.splitlines()[0] for s in statements[2:]] == [
+        "CREATE TABLE IF NOT EXISTS workspace.power_raw.bronze_prices (",
+        "CREATE TABLE IF NOT EXISTS workspace.power_raw.bronze_load (",
+        "CREATE TABLE IF NOT EXISTS workspace.power_raw.bronze_generation (",
+        "CREATE TABLE IF NOT EXISTS workspace.power_raw.bronze_flows (",
+        "CREATE TABLE IF NOT EXISTS workspace.power_raw.ingestion_log (",
+    ]
+    assert statements[0].startswith("CREATE SCHEMA IF NOT EXISTS workspace.power_raw ")
+    assert statements[1].startswith("CREATE VOLUME IF NOT EXISTS workspace.power_raw.landing ")
 
 
-def test_bronze_table_has_every_schema_column_and_is_append_only():
-    table_sql = ingest.setup_statements()[2]
+@pytest.mark.parametrize("dataset", ["prices", "load", "generation", "flows"])
+def test_each_bronze_table_has_every_schema_column_and_is_append_only(dataset):
+    [table_sql] = [
+        s for s in ingest.setup_statements() if f"{ingest.BRONZE_TABLES[dataset]} (" in s
+    ]
 
-    for name in ingest.BRONZE_PRICES_SCHEMA.names:
+    for name in ingest.BRONZE_SCHEMAS[dataset].names:
         assert f"    {name} " in table_sql
     assert "'delta.appendOnly' = 'true'" in table_sql
+
+
+def test_ingestion_log_table_has_every_column_and_is_append_only():
+    [log_sql] = [s for s in ingest.setup_statements() if "ingestion_log (" in s]
+
+    for name in ingest.INGESTION_LOG_SCHEMA.names:
+        assert f"    {name} " in log_sql
+    assert "'delta.appendOnly' = 'true'" in log_sql
 
 
 def test_copy_into_bronze_sql_reads_the_dataset_folder():
@@ -262,9 +281,27 @@ def to_bronze(xml=PRICES_DE_LU, **overrides):
     return ingest.to_bronze_frame(parse_timeseries(xml), **(args | overrides))
 
 
-def test_bronze_schema_ends_with_the_classification_sequence():
-    assert ingest.BRONZE_PRICES_SCHEMA.names[-1] == "classification_sequence"
-    assert ingest.BRONZE_PRICES_SCHEMA.field("classification_sequence").type == pa.int32()
+def test_columns_added_later_sit_at_the_end_in_the_order_they_came():
+    for schema in (ingest.ZONE_BRONZE_SCHEMA, ingest.BORDER_BRONZE_SCHEMA):
+        assert schema.names[-3:] == ["classification_sequence", "in_domain", "out_domain"]
+        assert schema.field("classification_sequence").type == pa.int32()
+
+
+def test_zone_and_border_schemas_differ_only_in_location_columns():
+    zone, border = ingest.ZONE_BRONZE_SCHEMA, ingest.BORDER_BRONZE_SCHEMA
+
+    assert "zone" in zone.names and "zone" not in border.names
+    assert {"from_zone", "to_zone"} <= set(border.names)
+    assert [n for n in zone.names if n != "zone"] == [
+        n for n in border.names if n not in ("from_zone", "to_zone")
+    ]
+    schemas_by_dataset = ingest.BRONZE_SCHEMAS
+    assert schemas_by_dataset == {
+        "prices": zone,
+        "load": zone,
+        "generation": zone,
+        "flows": border,
+    }
 
 
 def test_to_bronze_frame_has_exactly_the_bronze_columns():
@@ -319,29 +356,52 @@ def test_bronze_frame_round_trips_through_parquet(tmp_path, xml, sequences):
     assert table.column("value").to_pylist() == frame["value"].tolist()
 
 
+def full_columns(table):
+    if table == ingest.INGESTION_LOG_TABLE:
+        return set(ingest.INGESTION_LOG_SCHEMA.names)
+    dataset = table.rsplit("bronze_", 1)[1]
+    return set(ingest.BRONZE_SCHEMAS[dataset].names)
+
+
 def test_ensure_setup_adds_columns_an_existing_table_lacks(monkeypatch):
     ran = []
-    monkeypatch.setattr(ingest.dbx, "run_sql", lambda sql, wh, client=None: ran.append(sql))
-    existing = set(ingest.BRONZE_PRICES_SCHEMA.names) - {"classification_sequence"}
-    monkeypatch.setattr(ingest.dbx, "table_columns", lambda table, wh, client=None: existing)
+    monkeypatch.setattr(
+        ingest.dbx, "run_sql", lambda sql, wh, parameters=None, client=None: ran.append(sql)
+    )
+
+    def columns_now(table, wh, client=None):
+        # bronze_prices as it stood after Phase 00: without the two domain columns.
+        if table.endswith("bronze_prices"):
+            return full_columns(table) - {"in_domain", "out_domain"}
+        return full_columns(table)
+
+    monkeypatch.setattr(ingest.dbx, "table_columns", columns_now)
 
     statements = ingest.ensure_setup("wh-1")
 
     alter = (
-        "ALTER TABLE workspace.power_raw.bronze_prices ADD COLUMNS (classification_sequence INT)"
+        "ALTER TABLE workspace.power_raw.bronze_prices "
+        "ADD COLUMNS (in_domain STRING, out_domain STRING)"
     )
     assert statements == [*ingest.setup_statements(), alter]
     assert ran == statements
 
 
-def test_ensure_setup_alters_nothing_when_the_table_is_up_to_date(monkeypatch):
-    ran = []
-    monkeypatch.setattr(ingest.dbx, "run_sql", lambda sql, wh, client=None: ran.append(sql))
-    up_to_date = set(ingest.BRONZE_PRICES_SCHEMA.names)
-    monkeypatch.setattr(ingest.dbx, "table_columns", lambda table, wh, client=None: up_to_date)
+def test_ensure_setup_alters_nothing_when_every_table_is_up_to_date(monkeypatch):
+    ran, checked = [], []
+    monkeypatch.setattr(
+        ingest.dbx, "run_sql", lambda sql, wh, parameters=None, client=None: ran.append(sql)
+    )
+
+    def columns_now(table, wh, client=None):
+        checked.append(table)
+        return full_columns(table)
+
+    monkeypatch.setattr(ingest.dbx, "table_columns", columns_now)
 
     assert ingest.ensure_setup("wh-1") == ingest.setup_statements()
     assert ran == ingest.setup_statements()
+    assert checked == [*ingest.BRONZE_TABLES.values(), ingest.INGESTION_LOG_TABLE]
 
 
 @pytest.fixture
@@ -439,7 +499,203 @@ def test_ingest_day_keeps_a_no_data_answer_as_raw_only(tmp_path, fake_services):
 
 
 def test_ingest_day_refuses_a_dataset_without_a_bronze_table(tmp_path, fake_services):
-    with pytest.raises(ValueError, match="no bronze table for load"):
-        run_ingest_day(tmp_path, dataset="load")
+    with pytest.raises(ValueError, match="no bronze table for weather"):
+        run_ingest_day(tmp_path, dataset="weather")
 
     assert fake_services["fetch"] == []
+
+
+def test_ingest_day_refuses_a_border_dataset(tmp_path, fake_services):
+    with pytest.raises(ValueError, match="flows is requested per border direction"):
+        run_ingest_day(tmp_path, dataset="flows")
+
+    assert fake_services["fetch"] == []
+
+
+FLOWS_CH_DE_LU = (FIXTURES / "flows_ch_de_lu_2026-09-23.xml").read_bytes()
+GENERATION_DE_LU = (FIXTURES / "generation_de_lu_2026-09-23_trimmed.xml").read_bytes()
+FLOWS_RAW_FILE = "/Volumes/workspace/power_raw/landing/entsoe/flows/CH_TO_DE_LU/2026/09/x.xml.gz"
+
+
+def flows_bronze(**overrides):
+    args = {
+        "dataset": "flows",
+        "from_zone": "CH",
+        "to_zone": "DE_LU",
+        "ingested_at_utc": INGESTED_AT,
+        "source_file": FLOWS_RAW_FILE,
+        "request_params": {"documentType": "A11"},
+    }
+    return ingest.to_bronze_frame(parse_timeseries(FLOWS_CH_DE_LU), **(args | overrides))
+
+
+def test_flows_bronze_rows_carry_both_zones_and_the_parsed_domains():
+    frame = flows_bronze()
+
+    assert list(frame.columns) == ingest.BORDER_BRONZE_SCHEMA.names
+    assert len(frame) == 96
+    assert set(frame["from_zone"]) == {"CH"}
+    assert set(frame["to_zone"]) == {"DE_LU"}
+    assert set(frame["out_domain"]) == {"10YCH-SWISSGRIDZ"}
+    assert set(frame["in_domain"]) == {"10Y1001A1001A82H"}
+    assert set(frame["unit"]) == {"MAW"}
+
+
+@pytest.mark.parametrize(
+    "location",
+    [{"zone": "CH"}, {"from_zone": "CH"}, {"zone": "CH", "from_zone": "CH", "to_zone": "DE_LU"}],
+)
+def test_flows_bronze_rows_need_from_and_to_zones_only(location):
+    args = {"from_zone": None, "to_zone": None} | location
+
+    with pytest.raises(ValueError, match="flows rows need from_zone and to_zone"):
+        flows_bronze(**args)
+
+
+def test_zone_bronze_rows_refuse_border_zones():
+    with pytest.raises(ValueError, match="prices rows need zone"):
+        to_bronze(zone=None, from_zone="CH", to_zone="DE_LU")
+
+
+def test_generation_bronze_rows_keep_production_type_and_domains():
+    frame = ingest.to_bronze_frame(
+        parse_timeseries(GENERATION_DE_LU),
+        dataset="generation",
+        zone="DE_LU",
+        ingested_at_utc=INGESTED_AT,
+        source_file=RAW_FILE,
+        request_params={"documentType": "A75"},
+    )
+
+    pumping = frame[(frame["psr_type"] == "B10") & frame["out_domain"].notna()]
+    assert len(frame) == 479
+    assert set(frame["psr_type"]) == {"B09", "B10", "B16", "B17"}
+    assert len(pumping) == 96
+    assert pumping["in_domain"].isna().all()
+
+
+@pytest.mark.parametrize(
+    ("dataset", "xml", "location"),
+    [
+        ("generation", GENERATION_DE_LU, {"zone": "DE_LU"}),
+        ("flows", FLOWS_CH_DE_LU, {"from_zone": "CH", "to_zone": "DE_LU"}),
+    ],
+    ids=["generation", "flows"],
+)
+def test_new_bronze_frames_round_trip_through_parquet(tmp_path, dataset, xml, location):
+    frame = ingest.to_bronze_frame(
+        parse_timeseries(xml),
+        dataset=dataset,
+        ingested_at_utc=INGESTED_AT,
+        source_file=RAW_FILE,
+        request_params={"documentType": "x"},
+        **location,
+    )
+    path = tmp_path / f"{dataset}.parquet"
+
+    ingest.write_parquet(frame, path, ingest.BRONZE_SCHEMAS[dataset])
+    table = pq.read_table(path)
+
+    assert table.schema.remove_metadata() == ingest.BRONZE_SCHEMAS[dataset]
+    assert table.num_rows == len(frame)
+    assert table.column("value").to_pylist() == frame["value"].tolist()
+    assert table.column("psr_type").to_pylist() == [
+        None if pd.isna(v) else v for v in frame["psr_type"]
+    ]
+
+
+@pytest.mark.parametrize("dataset", ["load", "generation", "flows"])
+def test_copy_into_reads_each_dataset_folder_into_its_own_table(dataset):
+    sql = ingest.copy_into_bronze_sql(dataset)
+
+    assert sql.startswith(f"COPY INTO workspace.power_raw.bronze_{dataset}\n")
+    assert f"FROM '/Volumes/workspace/power_raw/landing/parsed/entsoe/{dataset}'" in sql
+
+
+# Ingestion log
+
+WINDOW = (datetime(2024, 4, 30, 22, tzinfo=UTC), datetime(2024, 5, 31, 22, tzinfo=UTC))
+
+
+def log_entry(**overrides):
+    args = {
+        "run_id": "run-1",
+        "dataset": "prices",
+        "zone_or_border": "DE_LU",
+        "window_start_utc": WINDOW[0],
+        "window_end_utc": WINDOW[1],
+        "status": "success",
+        "http_status": 200,
+        "rows_parsed": 3720,
+        "duration_s": 10.2,
+        "error_message": None,
+        "logged_at_utc": INGESTED_AT,
+        "warnings": None,
+        "raw_file": RAW_FILE,
+    }
+    return ingest.LogEntry(**(args | overrides))
+
+
+def test_log_entry_accepts_only_known_statuses():
+    with pytest.raises(ValueError, match="status must be one of"):
+        log_entry(status="partial")
+
+
+def test_insert_log_sql_names_every_column_once():
+    sql = ingest.insert_log_sql()
+    names = ingest.INGESTION_LOG_SCHEMA.names
+
+    assert sql.startswith("INSERT INTO workspace.power_raw.ingestion_log (")
+    assert f"({', '.join(names)})" in sql
+    assert f"VALUES ({', '.join(':' + n for n in names)})" in sql
+
+
+def test_log_request_sends_every_column_as_a_parameter(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        ingest.dbx,
+        "run_sql",
+        lambda sql, wh, parameters=None, client=None: calls.append((sql, wh, parameters)),
+    )
+    entry = log_entry(status="error", http_status=503, error_message="HTTP 503", rows_parsed=0)
+
+    ingest.log_request(entry, "wh-1")
+
+    [(sql, warehouse_id, parameters)] = calls
+    assert sql == ingest.insert_log_sql()
+    assert warehouse_id == "wh-1"
+    assert list(parameters) == ingest.INGESTION_LOG_SCHEMA.names
+    assert parameters["status"] == "error"
+    assert parameters["http_status"] == 503
+    assert parameters["window_start_utc"] == WINDOW[0]
+    assert parameters["warnings"] is None
+
+
+def test_successful_windows_reads_utc_pairs_and_filters_by_time(monkeypatch):
+    calls = []
+
+    def fake_run_sql(sql, wh, parameters=None, client=None):
+        calls.append((sql, parameters))
+        return [
+            {
+                "window_start_utc": "2024-04-30T22:00:00.000Z",
+                "window_end_utc": "2024-05-31T22:00:00.000Z",
+            },
+            {"window_start_utc": "2024-03-31T22:00:00Z", "window_end_utc": "2024-04-30T22:00:00Z"},
+        ]
+
+    monkeypatch.setattr(ingest.dbx, "run_sql", fake_run_sql)
+    not_before = datetime(2026, 10, 25, tzinfo=UTC)
+
+    windows = ingest.successful_windows(
+        "prices", "DE_LU", not_before=not_before, warehouse_id="wh-1"
+    )
+
+    assert windows == {
+        WINDOW,
+        (datetime(2024, 3, 31, 22, tzinfo=UTC), datetime(2024, 4, 30, 22, tzinfo=UTC)),
+    }
+    [(sql, parameters)] = calls
+    assert "status = 'success'" in sql
+    assert "logged_at_utc >= :not_before" in sql
+    assert parameters == {"dataset": "prices", "zone_or_border": "DE_LU", "not_before": not_before}

@@ -19,33 +19,80 @@ from power_pipeline.entsoe import datasets, parsers
 
 _UTC_TIMESTAMP = pa.timestamp("us", tz="UTC")
 
-# One schema for both the Parquet files and the bronze table, so they cannot drift.
-# Microsecond timestamps, because Spark cannot read Parquet timestamps in nanoseconds.
-BRONZE_PRICES_SCHEMA = pa.schema(
+
+def _bronze_schema(location_columns: list[str]) -> pa.Schema:
+    """Bronze columns. Zone datasets have `zone`. Flows have `from_zone` and `to_zone`.
+
+    One schema defines both the Parquet files and the table, so they cannot drift.
+    Microsecond timestamps, because Spark cannot read Parquet timestamps in nanoseconds.
+    Columns added after a table first existed sit at the end, in the order they came.
+    """
+    return pa.schema(
+        [
+            ("dataset", pa.string()),
+            *[(name, pa.string()) for name in location_columns],
+            ("psr_type", pa.string()),
+            ("resolution", pa.string()),
+            ("interval_start_utc", _UTC_TIMESTAMP),
+            ("interval_end_utc", _UTC_TIMESTAMP),
+            ("value", pa.float64()),
+            ("unit", pa.string()),
+            ("document_mrid", pa.string()),
+            ("time_series_mrid", pa.string()),
+            ("revision_number", pa.int32()),
+            ("created_datetime_utc", _UTC_TIMESTAMP),
+            ("ingested_at_utc", _UTC_TIMESTAMP),
+            ("source_file", pa.string()),
+            ("request_params", pa.string()),
+            # Added 2026-10-13. Prices only: 1 = SDAC, 2 = EXAA, null otherwise.
+            ("classification_sequence", pa.int32()),
+            # Added 2026-10-25. EIC codes from the series. For generation, an out
+            # domain means consumption, such as pumped storage pumping.
+            ("in_domain", pa.string()),
+            ("out_domain", pa.string()),
+        ]
+    )
+
+
+ZONE_BRONZE_SCHEMA = _bronze_schema(["zone"])
+BORDER_BRONZE_SCHEMA = _bronze_schema(["from_zone", "to_zone"])
+BRONZE_PRICES_SCHEMA = ZONE_BRONZE_SCHEMA
+
+BRONZE_TABLES = {
+    name: f"{dbx.RAW_SCHEMA}.bronze_{name}" for name in ("prices", "load", "generation", "flows")
+}
+BRONZE_SCHEMAS = {
+    "prices": ZONE_BRONZE_SCHEMA,
+    "load": ZONE_BRONZE_SCHEMA,
+    "generation": ZONE_BRONZE_SCHEMA,
+    "flows": BORDER_BRONZE_SCHEMA,
+}
+BRONZE_COMMENTS = {
+    "prices": "Day-ahead prices from ENTSO-E A44 documents, SDAC and EXAA series.",
+    "load": "Actual total load from ENTSO-E A65 documents, in MW.",
+    "generation": "Actual generation per production type from ENTSO-E A75 documents, in MW.",
+    "flows": "Cross-border physical flows from ENTSO-E A11 documents, one direction a row, in MW.",
+}
+
+INGESTION_LOG_TABLE = f"{dbx.RAW_SCHEMA}.ingestion_log"
+INGESTION_LOG_SCHEMA = pa.schema(
     [
+        ("run_id", pa.string()),
         ("dataset", pa.string()),
-        ("zone", pa.string()),
-        ("psr_type", pa.string()),
-        ("resolution", pa.string()),
-        ("interval_start_utc", _UTC_TIMESTAMP),
-        ("interval_end_utc", _UTC_TIMESTAMP),
-        ("value", pa.float64()),
-        ("unit", pa.string()),
-        ("document_mrid", pa.string()),
-        ("time_series_mrid", pa.string()),
-        ("revision_number", pa.int32()),
-        ("created_datetime_utc", _UTC_TIMESTAMP),
-        ("ingested_at_utc", _UTC_TIMESTAMP),
-        ("source_file", pa.string()),
-        ("request_params", pa.string()),
-        # 1 = SDAC, 2 = EXAA, null where a zone has a single series. Added after the
-        # table first existed, so it sits last.
-        ("classification_sequence", pa.int32()),
+        ("zone_or_border", pa.string()),
+        ("window_start_utc", _UTC_TIMESTAMP),
+        ("window_end_utc", _UTC_TIMESTAMP),
+        ("status", pa.string()),
+        ("http_status", pa.int32()),
+        ("rows_parsed", pa.int64()),
+        ("duration_s", pa.float64()),
+        ("error_message", pa.string()),
+        ("logged_at_utc", _UTC_TIMESTAMP),
+        # Beyond the spec: data-quality findings, and the raw XML's volume path.
+        ("warnings", pa.string()),
+        ("raw_file", pa.string()),
     ]
 )
-
-BRONZE_TABLES = {"prices": f"{dbx.RAW_SCHEMA}.bronze_prices"}
-BRONZE_SCHEMAS = {"prices": BRONZE_PRICES_SCHEMA}
 
 RAW_VOLUME_DIR = dbx.LANDING_ROOT
 PARSED_VOLUME_DIR = f"{dbx.LANDING_ROOT}/parsed"
@@ -145,19 +192,32 @@ def write_parquet(frame: pd.DataFrame, path: Path, schema: pa.Schema) -> None:
 
 
 def setup_statements() -> list[str]:
-    """SQL that creates the raw schema, landing volume and bronze tables if missing."""
-    return [
+    """SQL that creates the raw schema, landing volume, bronze tables and log if missing."""
+    statements = [
         dbx.create_schema_sql(dbx.RAW_SCHEMA, "ENTSO-E data exactly as received. Append-only."),
         dbx.create_volume_sql(
             dbx.LANDING_VOLUME, "Raw ENTSO-E XML (gzipped) and the Parquet parsed from it."
         ),
-        dbx.create_append_only_table_sql(
-            BRONZE_TABLES["prices"],
-            BRONZE_PRICES_SCHEMA,
-            "Day-ahead prices parsed from ENTSO-E A44 documents. One row per interval "
-            "per fetch. Timestamps in UTC. Append-only.",
-        ),
     ]
+    for dataset, table in BRONZE_TABLES.items():
+        comment = (
+            f"{BRONZE_COMMENTS[dataset]} One row per interval per fetch. "
+            "Timestamps in UTC. Append-only."
+        )
+        statements.append(dbx.create_append_only_table_sql(table, BRONZE_SCHEMAS[dataset], comment))
+    statements.append(
+        dbx.create_append_only_table_sql(
+            INGESTION_LOG_TABLE,
+            INGESTION_LOG_SCHEMA,
+            "One row per ENTSO-E request: status success, no_data or error. Append-only.",
+        )
+    )
+    return statements
+
+
+def _tables_and_schemas() -> list[tuple[str, pa.Schema]]:
+    pairs = [(table, BRONZE_SCHEMAS[dataset]) for dataset, table in BRONZE_TABLES.items()]
+    return [*pairs, (INGESTION_LOG_TABLE, INGESTION_LOG_SCHEMA)]
 
 
 def copy_into_bronze_sql(dataset: str) -> str:
@@ -174,16 +234,16 @@ def load_bronze(dataset: str, warehouse_id: str, *, client: WorkspaceClient | No
 
 
 def ensure_setup(warehouse_id: str, *, client: WorkspaceClient | None = None) -> list[str]:
-    """Create the raw schema, volume and bronze tables, then add any columns they lack.
+    """Create the raw schema, volume, bronze tables and log, then add columns they lack.
 
     Safe to run any number of times. Returns the statements it ran.
     """
     statements = setup_statements()
     for statement in statements:
         dbx.run_sql(statement, warehouse_id, client=client)
-    for dataset, table in BRONZE_TABLES.items():
+    for table, schema in _tables_and_schemas():
         existing = dbx.table_columns(table, warehouse_id, client=client)
-        alter = dbx.add_missing_columns_sql(table, BRONZE_SCHEMAS[dataset], existing)
+        alter = dbx.add_missing_columns_sql(table, schema, existing)
         if alter:
             dbx.run_sql(alter, warehouse_id, client=client)
             statements.append(alter)
@@ -194,25 +254,38 @@ def to_bronze_frame(
     parsed: pd.DataFrame,
     *,
     dataset: str,
-    zone: str,
     ingested_at_utc: datetime,
     source_file: str,
     request_params: dict[str, str],
+    zone: str | None = None,
+    from_zone: str | None = None,
+    to_zone: str | None = None,
 ) -> pd.DataFrame:
     """Add the columns every raw record must carry (data rule 2) to the parser's output.
 
-    `source_file` is the volume path of the raw XML the rows came from. `psr_type` and
-    `unit` come from the parser, which reads them from the XML.
+    Zone datasets take `zone`. Flows take `from_zone` and `to_zone`. `source_file` is
+    the volume path of the raw XML the rows came from. `psr_type`, `unit` and the
+    domains come from the parser, which reads them from the XML.
     """
     if entsoe.TOKEN_PARAM in request_params:
         raise ValueError("request_params must not contain the token.")
+    schema = BRONZE_SCHEMAS[dataset]
+    is_border = "from_zone" in schema.names
+    if is_border and not (from_zone and to_zone and zone is None):
+        raise ValueError(f"{dataset} rows need from_zone and to_zone, not zone.")
+    if not is_border and not (zone and from_zone is None and to_zone is None):
+        raise ValueError(f"{dataset} rows need zone, not from_zone and to_zone.")
     frame = parsed.copy()
     frame["dataset"] = dataset
-    frame["zone"] = zone
+    if is_border:
+        frame["from_zone"] = from_zone
+        frame["to_zone"] = to_zone
+    else:
+        frame["zone"] = zone
     frame["ingested_at_utc"] = pd.Timestamp(_as_utc(ingested_at_utc, "ingested_at_utc"))
     frame["source_file"] = source_file
     frame["request_params"] = json.dumps(request_params, sort_keys=True)
-    return frame[BRONZE_SCHEMAS[dataset].names]
+    return frame[schema.names]
 
 
 @dataclass(frozen=True)
@@ -244,6 +317,8 @@ def ingest_day(
     if dataset_name not in BRONZE_TABLES:
         raise ValueError(f"There is no bronze table for {dataset_name} yet.")
     dataset = datasets.load_datasets()[dataset_name]
+    if dataset.scope != "zone":
+        raise ValueError(f"{dataset_name} is requested per border direction, not per zone.")
     zone = datasets.load_zones()[zone_code]
     start, end = delivery_day_window_utc(delivery_date)
     result = entsoe.fetch(datasets.build_params(dataset, zone, start, end), token)
@@ -271,3 +346,81 @@ def ingest_day(
     dbx.upload_file(parsed_local, parsed_volume, client=workspace)
     rows_loaded = load_bronze(dataset_name, warehouse_id, client=workspace)
     return IngestResult("data", len(frame), rows_loaded, raw_volume, parsed_volume)
+
+
+LOG_STATUSES = ("success", "no_data", "error")
+
+
+@dataclass(frozen=True)
+class LogEntry:
+    """One row of the ingestion log: what happened to one ENTSO-E request."""
+
+    run_id: str
+    dataset: str
+    zone_or_border: str
+    window_start_utc: datetime
+    window_end_utc: datetime
+    status: str
+    http_status: int | None
+    rows_parsed: int
+    duration_s: float
+    error_message: str | None
+    logged_at_utc: datetime
+    warnings: str | None = None
+    raw_file: str | None = None
+
+    def __post_init__(self):
+        if self.status not in LOG_STATUSES:
+            raise ValueError(f"status must be one of {LOG_STATUSES}, not {self.status!r}.")
+
+
+def insert_log_sql() -> str:
+    """INSERT for one log row. Values are named parameters, one per column."""
+    names = INGESTION_LOG_SCHEMA.names
+    columns = ", ".join(names)
+    markers = ", ".join(f":{name}" for name in names)
+    return f"INSERT INTO {INGESTION_LOG_TABLE} ({columns}) VALUES ({markers})"
+
+
+def log_request(
+    entry: LogEntry, warehouse_id: str, *, client: WorkspaceClient | None = None
+) -> None:
+    """Append one row to the ingestion log."""
+    values = {name: getattr(entry, name) for name in INGESTION_LOG_SCHEMA.names}
+    dbx.run_sql(insert_log_sql(), warehouse_id, parameters=values, client=client)
+
+
+def successful_windows(
+    dataset: str,
+    zone_or_border: str,
+    *,
+    not_before: datetime,
+    warehouse_id: str,
+    client: WorkspaceClient | None = None,
+) -> set[tuple[datetime, datetime]]:
+    """Windows with a `success` row logged at or after `not_before`, as UTC pairs.
+
+    The backfill passes the earliest possible time, so any past success counts. The
+    daily job passes the start of the run day, so only today's successes count.
+    """
+    rows = dbx.run_sql(
+        f"SELECT DISTINCT window_start_utc, window_end_utc FROM {INGESTION_LOG_TABLE} "
+        "WHERE dataset = :dataset AND zone_or_border = :zone_or_border "
+        "AND status = 'success' AND logged_at_utc >= :not_before",
+        warehouse_id,
+        parameters={
+            "dataset": dataset,
+            "zone_or_border": zone_or_border,
+            "not_before": not_before,
+        },
+        client=client,
+    )
+    return {
+        (_api_timestamp(row["window_start_utc"]), _api_timestamp(row["window_end_utc"]))
+        for row in rows
+    }
+
+
+def _api_timestamp(value: str) -> datetime:
+    """Read a timestamp the statement execution API returns, such as 2026-10-11T22:00:00.000Z."""
+    return datetime.fromisoformat(value).astimezone(UTC)
