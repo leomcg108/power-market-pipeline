@@ -3,11 +3,16 @@
 import os
 import re
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pyarrow as pa
 from databricks.sdk import WorkspaceClient
-from databricks.sdk.service.sql import ExecuteStatementRequestOnWaitTimeout, StatementState
+from databricks.sdk.service.sql import (
+    ExecuteStatementRequestOnWaitTimeout,
+    StatementParameterListItem,
+    StatementState,
+)
 
 CATALOG = "workspace"
 RAW_SCHEMA = f"{CATALOG}.power_raw"
@@ -48,10 +53,40 @@ def warehouse_id_from_env() -> str:
     return warehouse_id_from_http_path(http_path)
 
 
+SqlValue = str | int | float | datetime | None
+
+
+def sql_parameters(values: dict[str, SqlValue]) -> list[StatementParameterListItem]:
+    """Named parameters for a statement that refers to them as :name.
+
+    Values travel separately from the SQL text, so they need no quoting. Timestamps
+    must be timezone-aware and are sent in UTC. None becomes NULL.
+    """
+    items = []
+    for name, value in values.items():
+        if value is None:
+            items.append(StatementParameterListItem(name=name, value=None, type="STRING"))
+        elif isinstance(value, bool):
+            raise TypeError(f"Parameter {name}: booleans are not supported.")
+        elif isinstance(value, int):
+            items.append(StatementParameterListItem(name=name, value=str(value), type="BIGINT"))
+        elif isinstance(value, float):
+            items.append(StatementParameterListItem(name=name, value=repr(value), type="DOUBLE"))
+        elif isinstance(value, datetime):
+            if value.tzinfo is None:
+                raise ValueError(f"Parameter {name}: timestamps must be timezone-aware.")
+            text = value.astimezone(UTC).isoformat()
+            items.append(StatementParameterListItem(name=name, value=text, type="TIMESTAMP"))
+        else:
+            items.append(StatementParameterListItem(name=name, value=str(value), type="STRING"))
+    return items
+
+
 def run_sql(
     statement: str,
     warehouse_id: str,
     *,
+    parameters: dict[str, SqlValue] | None = None,
     client: WorkspaceClient | None = None,
     timeout_s: float = 600,
     poll_interval_s: float = 2,
@@ -61,13 +96,14 @@ def run_sql(
     Uses the statement execution API, so no database driver is needed. A stopped
     serverless warehouse starts on the first statement, which can take a minute, so
     this keeps polling until the statement finishes or `timeout_s` passes. Values come
-    back as strings, the way the API returns them.
+    back as strings, the way the API returns them. `parameters` fill :name markers.
     """
     client = client or WorkspaceClient()
     api = client.statement_execution
     response = api.execute_statement(
         statement=statement,
         warehouse_id=warehouse_id,
+        parameters=sql_parameters(parameters) if parameters else None,
         wait_timeout="30s",
         on_wait_timeout=ExecuteStatementRequestOnWaitTimeout.CONTINUE,
     )

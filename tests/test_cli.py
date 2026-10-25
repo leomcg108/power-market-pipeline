@@ -271,13 +271,13 @@ def test_ingest_day_reports_api_errors(monkeypatch, tmp_path):
     assert "error: HTTP 401" in result.output
 
 
-def test_ingest_day_rejects_a_dataset_without_a_bronze_table(tmp_path):
-    args = ["ingest-day", "--dataset", "load", "--zone", "CH", "--date", "2026-09-23"]
+def test_ingest_day_rejects_flows_because_they_are_fetched_per_border(tmp_path):
+    args = ["ingest-day", "--dataset", "flows", "--zone", "CH", "--date", "2026-09-23"]
 
     result = runner.invoke(app, [*args, "--data-dir", str(tmp_path)])
 
     assert result.exit_code == 2
-    assert "choose from ['prices']" in result.output
+    assert "choose from ['generation', 'load', 'prices']" in result.output
 
 
 def test_load_bronze_prints_the_rows_loaded(monkeypatch):

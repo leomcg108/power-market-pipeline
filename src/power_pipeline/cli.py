@@ -170,9 +170,13 @@ def ingest_day(
     data_dir: Annotated[Path, typer.Option(help="Local data folder.")] = Path("data"),
 ) -> None:
     """Fetch one delivery day, store raw XML and Parquet in the volume, and load bronze."""
-    if dataset not in ingest.BRONZE_TABLES:
+    zone_datasets = sorted(
+        name for name, spec in datasets.load_datasets().items() if spec.scope == "zone"
+    )
+    if dataset not in zone_datasets:
         raise typer.BadParameter(
-            f"choose from {sorted(ingest.BRONZE_TABLES)}", param_hint="--dataset"
+            f"choose from {zone_datasets}. Flows are fetched per border by the backfill.",
+            param_hint="--dataset",
         )
     known_zones = datasets.load_zones()
     if zone not in known_zones:
